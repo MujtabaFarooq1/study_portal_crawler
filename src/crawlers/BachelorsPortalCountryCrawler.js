@@ -1,19 +1,122 @@
 import PlaywrightBaseCrawler from "./PlaywrightBaseCrawler.js";
-import { appendToCSV } from "../utils/csvWriter.js";
+import { appendToCountryCSV } from "../utils/csvWriterByCountry.js";
+import { applyCurrencyByCountryContext } from "../utils/applyCurrencyByCountryContext.js";
+import { getCountryFromUrl } from "../utils/getCountryFromUrl.js";
+import { COUNTRY_CURRENCY_MAP } from "../constants/country_currency_map.js";
 
 /**
- * Bachelors Portal crawler using Playwright (browser automation)
- * Bypasses Cloudflare and other anti-bot protection
+ * Bachelors Portal crawler for specific countries
+ * Uses Playwright to bypass Cloudflare and anti-bot protection
  */
-export default class BachelorsPortalPlaywrightCrawler extends PlaywrightBaseCrawler {
+export default class BachelorsPortalCountryCrawler extends PlaywrightBaseCrawler {
   constructor(config = {}) {
+    const countryLabel = config.countryLabel || "";
+    const targetUrl = countryLabel
+      ? `https://www.bachelorsportal.com/search/bachelor/${countryLabel}`
+      : "https://www.bachelorsportal.com/search/bachelor";
+
     super({
       baseUrl: "https://www.bachelorsportal.com",
-      targetUrl: "https://www.bachelorsportal.com/search/bachelor",
+      targetUrl: targetUrl,
       maxCrawlLength: config.maxCrawlLength || 50,
       requestDelay: config.requestDelay || 2000,
       headless: config.headless !== false,
     });
+
+    this.countryLabel = countryLabel;
+    this.portalType = "bachelors";
+    this.currentCountryContext = countryLabel; // Track country context for study pages
+  }
+
+  /**
+   * Override fetchPage to apply country-specific currency context
+   */
+  async fetchPage(url) {
+    const page = await this.context.newPage();
+
+    try {
+      // Add stealth scripts to hide automation
+      await page.addInitScript(() => {
+        Object.defineProperty(navigator, "webdriver", {
+          get: () => false,
+        });
+        Object.defineProperty(navigator, "plugins", {
+          get: () => [1, 2, 3, 4, 5],
+        });
+        Object.defineProperty(navigator, "languages", {
+          get: () => ["en-US", "en"],
+        });
+        window.chrome = {
+          runtime: {},
+        };
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) =>
+          parameters.name === "notifications"
+            ? Promise.resolve({ state: Notification.permission })
+            : originalQuery(parameters);
+      });
+
+      // Determine country context: from URL (search page) or from instance (study page)
+      const urlCountryKey = getCountryFromUrl(url);
+      const countryKey = urlCountryKey || this.currentCountryContext;
+
+      if (countryKey) {
+        // Find the country key in COUNTRY_CURRENCY_MAP
+        const countryEntry = Object.entries(COUNTRY_CURRENCY_MAP).find(
+          ([key, value]) => value.url_safe_label === this.countryLabel
+        );
+        const actualCountryKey = countryEntry ? countryEntry[0] : null;
+
+        if (actualCountryKey) {
+          await applyCurrencyByCountryContext(page, actualCountryKey);
+        }
+      }
+
+      // Navigate to page
+      await page.goto(url, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+
+      // Wait for network to settle
+      await page
+        .waitForLoadState("networkidle", { timeout: 15000 })
+        .catch(() => {
+          console.log("  ⏳ Network still active, continuing...");
+        });
+
+      // Wait for content based on page type
+      const isSearchPage = url.includes("/search/");
+      if (isSearchPage) {
+        console.log("  ⏳ Waiting for search results to load...");
+        try {
+          await page.waitForSelector('a[href*="/studies/"]', {
+            timeout: 30000,
+            state: "attached",
+          });
+          console.log("  ✓ Study links loaded");
+        } catch (e) {
+          console.log("  ⚠️  Study links not found after 30s, continuing anyway...");
+        }
+      } else {
+        console.log("  ⏳ Waiting for page content to load...");
+        await page.waitForTimeout(8000);
+      }
+
+      // Add human-like behavior
+      const randomDelay = Math.floor(Math.random() * 500) + 500;
+      await page.waitForTimeout(randomDelay);
+      await page.evaluate(() => {
+        window.scrollTo(0, Math.floor(Math.random() * 200));
+      });
+      await page.waitForTimeout(500);
+
+      const html = await page.content();
+      return { html, page };
+    } catch (error) {
+      await page.close();
+      throw new Error(`Failed to fetch ${url}: ${error.message}`);
+    }
   }
 
   async extractData($, url, page = null) {
@@ -23,14 +126,21 @@ export default class BachelorsPortalPlaywrightCrawler extends PlaywrightBaseCraw
       const data = await this.extractStudyPageData(page, url);
 
       if (data) {
-        appendToCSV({
-          ...data,
-          intakes: data.intakes?.join(", ") || "",
-          languageRequirements: JSON.stringify(data.languageRequirements || {}),
-          generalRequirements: Array.isArray(data.generalRequirements)
-            ? data.generalRequirements.join(" | ")
-            : data.generalRequirements || "",
-        });
+        // Save to country-specific CSV
+        appendToCountryCSV(
+          {
+            ...data,
+            intakes: data.intakes?.join(", ") || "",
+            languageRequirements: JSON.stringify(
+              data.languageRequirements || {}
+            ),
+            generalRequirements: Array.isArray(data.generalRequirements)
+              ? data.generalRequirements.join(" | ")
+              : data.generalRequirements || "",
+          },
+          this.portalType,
+          this.countryLabel
+        );
 
         return [data];
       }
@@ -190,7 +300,7 @@ export default class BachelorsPortalPlaywrightCrawler extends PlaywrightBaseCraw
   }
 
   /**
-   * URL filtering logic (unchanged)
+   * URL filtering logic
    */
   shouldCrawlUrl(url) {
     if (!super.shouldCrawlUrl(url)) return false;
@@ -198,7 +308,9 @@ export default class BachelorsPortalPlaywrightCrawler extends PlaywrightBaseCraw
     const cleanUrl = url.split("#")[0].split("?")[0];
 
     const isStudyPage = /\/studies\/\d+\/[^/]+\.html/.test(cleanUrl);
-    const isSearchPage = cleanUrl.endsWith("/search/bachelor");
+    const isSearchPage =
+      cleanUrl.includes("/search/bachelor") &&
+      (cleanUrl.includes(`/${this.countryLabel}`) || !this.countryLabel);
 
     if (isStudyPage) return true;
 

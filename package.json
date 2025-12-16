@@ -5,7 +5,10 @@
   "main": "index.js",
   "scripts": {
     "dev": "nodemon index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node test-country-crawler.js",
+    "crawl:all": "node crawl-all-countries.js",
+    "crawl:single": "node crawl-single-country.js",
+    "crawl:test": "node test-country-crawler.js"
   },
   "author": "",
   "license": "ISC",

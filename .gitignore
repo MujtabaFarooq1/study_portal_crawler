@@ -116,3 +116,6 @@ examples/*.png
 examples/*.html
 examples/*-data.json
 examples/*-results.json
+
+# Ignore all output generated
+output/
