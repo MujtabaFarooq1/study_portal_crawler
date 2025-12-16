@@ -35,6 +35,29 @@ async function extractStudyPageData(page) {
             }
         }
 
+        // Degree Type and Study Mode
+        const tags = document.querySelectorAll('.DegreeTags .Tag');
+
+        let degreeType = null;
+        let studyMode = null;
+
+        tags.forEach(tag => {
+            const text = tag.textContent.trim();
+
+            // Detect degree type (e.g. M.Sc., M.A., MBA, etc.)
+            if (/\.|Bachelor|Master|PhD/i.test(text)) {
+                degreeType = text;
+            }
+
+            // Detect study mode
+            if (/campus|online|distance|blended/i.test(text)) {
+                studyMode = text;
+            }
+        });
+
+        result.degreeType = degreeType;
+        result.studyMode = studyMode;
+
         // Quick Facts Section - Tuition Fee
         const tuitionFeeEl = document.querySelector(
             '.TuitionFeeContainer[data-target="international"] .Title'
