@@ -1,0 +1,118 @@
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Debug files
+debug/
+debug-*.html
+debug-*.json
+*-debug.html
+*-debug.json
+*-debug-*.html
+*-debug-*.json
+
+# Test outputs
+test-*.html
+test-*.json
+test-*.png
+*-test.html
+*-test.json
+
+# Screenshots
+*.png
+screenshots/
+*-screenshot.png
+*-full.png
+
+# Extracted data
+*-extracted-data.json
+*-results.json
+*-data.json
+extracted-data/
+results/
+
+# HTML dumps
+*.html
+crawler-fetched.html
+search-page-*.html
+study-page-*.html
+
+# Logs
+logs/
+*.log
+
+# Operating System
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.classpath
+
+# Playwright
+playwright/.auth/
+test-results/
+playwright-report/
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Coverage
+coverage/
+.nyc_output/
+
+# Python (if used for any scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Data files (keep structure, ignore data)
+data/*.json
+data/*.csv
+output/*.json
+output/*.csv
+
+# Keep example structure but ignore outputs
+examples/output/
+examples/screenshots/
+examples/*.png
+examples/*.html
+examples/*-data.json
+examples/*-results.json
