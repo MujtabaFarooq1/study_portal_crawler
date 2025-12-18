@@ -120,3 +120,6 @@ examples/*-results.json
 # Ignore all output generated
 output/
 crawler-state.json
+
+# Test folder for screenshots and debugging
+test/

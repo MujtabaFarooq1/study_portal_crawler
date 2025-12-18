@@ -2,7 +2,8 @@ import { COUNTRY_CURRENCY_MAP } from "./src/constants/country_currency_map.js";
 import MastersPortalCountryCrawler from "./src/crawlers/MastersPortalCountryCrawler.js";
 import BachelorsPortalCountryCrawler from "./src/crawlers/BachelorsPortalCountryCrawler.js";
 import StateManager from "./src/utils/stateManager.js";
-import { chromium } from "playwright";
+import { chromium, webkit } from "playwright-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import {
   extractStudyUrlsFromSearchPage,
   getNextPageUrl,
@@ -10,6 +11,50 @@ import {
 } from "./src/utils/extractStudyUrls.js";
 import { appendToCountryCSV } from "./src/utils/csvWriterByCountry.js";
 import { applyCurrencyByCountryContext } from "./src/utils/applyCurrencyByCountryContext.js";
+import fs from "fs";
+import path from "path";
+
+// Add stealth plugin to both browsers with custom config
+chromium.use(
+  StealthPlugin({
+    enabledEvasions: new Set([
+      'chrome.app',
+      'chrome.csi',
+      'chrome.loadTimes',
+      'chrome.runtime',
+      'iframe.contentWindow',
+      'media.codecs',
+      'navigator.hardwareConcurrency',
+      'navigator.languages',
+      'navigator.permissions',
+      'navigator.plugins',
+      'navigator.webdriver',
+      'window.outerdimensions',
+      'webgl.vendor',
+    ]),
+  })
+);
+
+// WebKit doesn't need user-agent-override since we set it manually
+webkit.use(
+  StealthPlugin({
+    enabledEvasions: new Set([
+      'chrome.app',
+      'chrome.csi',
+      'chrome.loadTimes',
+      'chrome.runtime',
+      'iframe.contentWindow',
+      'media.codecs',
+      'navigator.hardwareConcurrency',
+      'navigator.languages',
+      'navigator.permissions',
+      'navigator.plugins',
+      'navigator.webdriver',
+      'window.outerdimensions',
+      'webgl.vendor',
+    ]),
+  })
+);
 
 /**
  * Batch Crawler with Resume Capability
@@ -25,43 +70,253 @@ class BatchCrawler {
     this.stateManager = new StateManager();
     this.config = {
       requestDelay: config.requestDelay || 3000,
-      headless: false,
+      headless: config.headless,
       maxPagesPerCountry: config.maxPagesPerCountry || 999, // Max search pages to crawl
     };
-    this.browser = null;
-    this.context = null;
+    // Dual browser setup: Chromium for search, WebKit for study pages
+    this.chromiumBrowser = null;
+    this.chromiumContext = null;
+    this.webkitBrowser = null;
+    this.webkitContext = null;
   }
 
   /**
-   * Initialize browser
+   * Get random Chromium user agent
+   */
+  getChromiumUserAgent() {
+    const userAgents = [
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    ];
+    return userAgents[Math.floor(Math.random() * userAgents.length)];
+  }
+
+  /**
+   * Get random WebKit user agent
+   */
+  getWebKitUserAgent() {
+    const userAgents = [
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    ];
+    return userAgents[Math.floor(Math.random() * userAgents.length)];
+  }
+
+  /**
+   * Initialize dual browsers with stealth mode
+   * Chromium for search pages, WebKit for study pages
    */
   async initBrowser() {
-    console.log("🌐 Launching browser...");
-    this.browser = await chromium.launch({
+    console.log(`🌐 Launching DUAL BROWSER setup with STEALTH MODE...`);
+    console.log(`   - CHROMIUM for search pages (faster, less protection needed)`);
+    console.log(`   - WEBKIT for study pages (better Cloudflare evasion)`);
+
+    // Launch Chromium for search pages
+    this.chromiumBrowser = await chromium.launch({
       headless: this.config.headless,
       args: [
         "--disable-blink-features=AutomationControlled",
         "--no-sandbox",
         "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-web-security",
+        "--disable-features=IsolateOrigins,site-per-process",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-site-isolation-trials",
+        "--exclude-switches=enable-automation",
+        "--disable-infobars",
+        "--window-size=1920,1080",
+        "--start-maximized",
+        "--disable-notifications",
+        "--disable-popup-blocking",
       ],
     });
 
-    this.context = await this.browser.newContext({
+    const chromiumUserAgent = this.getChromiumUserAgent();
+    console.log(`   Chromium UA: ${chromiumUserAgent.substring(0, 70)}...`);
+
+    this.chromiumContext = await this.chromiumBrowser.newContext({
       viewport: { width: 1920, height: 1080 },
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      userAgent: chromiumUserAgent,
+      locale: "en-US",
+      timezoneId: "America/New_York",
+      permissions: ["geolocation"],
+      geolocation: { longitude: -74.006, latitude: 40.7128 },
+      hasTouch: false,
+      isMobile: false,
+      deviceScaleFactor: 1,
+      colorScheme: "light",
+      extraHTTPHeaders: {
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "DNT": "1",
+      },
     });
 
-    console.log("✓ Browser launched\n");
+    // Launch WebKit for study pages
+    this.webkitBrowser = await webkit.launch({
+      headless: this.config.headless,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+      ],
+    });
+
+    const webkitUserAgent = this.getWebKitUserAgent();
+    console.log(`   WebKit UA: ${webkitUserAgent.substring(0, 70)}...`);
+
+    this.webkitContext = await this.webkitBrowser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: webkitUserAgent,
+      locale: "en-US",
+      timezoneId: "America/New_York",
+      permissions: ["geolocation"],
+      geolocation: { longitude: -74.006, latitude: 40.7128 },
+      hasTouch: false,
+      isMobile: false,
+      deviceScaleFactor: 1,
+      colorScheme: "light",
+      extraHTTPHeaders: {
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "DNT": "1",
+      },
+    });
+
+    // Additional context-level evasions for both browsers
+    const stealthScript = () => {
+      // Overwrite the navigator.webdriver property
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+      });
+
+      // Mock permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+
+      // Mock plugins with realistic structure
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => {
+          const plugins = [
+            { 0: { type: "application/x-google-chrome-pdf" }, description: "Portable Document Format", filename: "internal-pdf-viewer", length: 1, name: "Chrome PDF Plugin" },
+            { 0: { type: "application/pdf" }, description: "", filename: "mhjfbmdgcfjbbpaeojofohoefgiehjai", length: 1, name: "Chrome PDF Viewer" },
+            { 0: { type: "application/x-nacl" }, 1: { type: "application/x-pnacl" }, description: "", filename: "internal-nacl-plugin", length: 2, name: "Native Client" }
+          ];
+          plugins.refresh = () => {};
+          return plugins;
+        },
+      });
+
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en'],
+      });
+
+      // Chrome runtime
+      window.chrome = {
+        runtime: {},
+        loadTimes: function () { },
+        csi: function () { },
+        app: {},
+      };
+
+      Object.defineProperty(navigator, 'platform', {
+        get: () => 'Win32',
+      });
+
+      Object.defineProperty(navigator, 'hardwareConcurrency', {
+        get: () => 8,
+      });
+
+      Object.defineProperty(navigator, 'deviceMemory', {
+        get: () => 8,
+      });
+
+      Object.defineProperty(navigator, 'maxTouchPoints', {
+        get: () => 0,
+      });
+
+      Object.defineProperty(navigator, 'connection', {
+        get: () => ({
+          effectiveType: '4g',
+          rtt: 50,
+          downlink: 10,
+          saveData: false,
+        }),
+      });
+
+      // Canvas fingerprint evasion
+      const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+      HTMLCanvasElement.prototype.toDataURL = function(type) {
+        if (type === 'image/png' && this.width === 0 && this.height === 0) {
+          return originalToDataURL.apply(this, arguments);
+        }
+        return originalToDataURL.apply(this, arguments);
+      };
+
+      // WebGL fingerprint evasion
+      const getParameter = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function(parameter) {
+        if (parameter === 37445) return 'Intel Inc.';
+        if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+        return getParameter.apply(this, arguments);
+      };
+
+      // Battery API
+      if (navigator.getBattery) {
+        navigator.getBattery = () => Promise.resolve({
+          charging: true,
+          chargingTime: 0,
+          dischargingTime: Infinity,
+          level: 1,
+          addEventListener: () => {},
+          removeEventListener: () => {},
+        });
+      }
+    };
+
+    await this.chromiumContext.addInitScript(stealthScript);
+    await this.webkitContext.addInitScript(stealthScript);
+
+    console.log(`✓ Both browsers launched with STEALTH MODE enabled\n`);
   }
 
   /**
-   * Close browser
+   * Close both browsers
    */
   async closeBrowser() {
-    if (this.context) await this.context.close();
-    if (this.browser) await this.browser.close();
-    console.log("\n🔒 Browser closed");
+    if (this.chromiumContext) await this.chromiumContext.close();
+    if (this.chromiumBrowser) await this.chromiumBrowser.close();
+    if (this.webkitContext) await this.webkitContext.close();
+    if (this.webkitBrowser) await this.webkitBrowser.close();
+    console.log("\n🔒 Both browsers closed");
   }
 
   /**
@@ -73,20 +328,54 @@ class BatchCrawler {
 
   /**
    * Crawl a single search page and extract study URLs
+   * Uses CHROMIUM browser for faster search page processing
    */
   async crawlSearchPage(url, countryLabel, portalType, countryKey) {
-    const page = await this.context.newPage();
+    const page = await this.chromiumContext.newPage();
 
     try {
+      // Add page-level stealth
+      await page.addInitScript(() => {
+        delete navigator.__proto__.webdriver;
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
+          configurable: true,
+        });
+        Object.defineProperty(window, 'navigator', {
+          value: new Proxy(navigator, {
+            has: (target, key) => (key === 'webdriver' ? false : key in target),
+            get: (target, key) => (key === 'webdriver' ? undefined : target[key]),
+          }),
+        });
+        Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+        Object.defineProperty(screen, 'availHeight', { get: () => 1080 });
+        Object.defineProperty(window, 'outerWidth', { get: () => 1920 });
+        Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
+      });
+
       // Apply currency context
       await applyCurrencyByCountryContext(page, countryKey);
 
+      // Simulate human behavior before navigation
+      await page.mouse.move(Math.random() * 100, Math.random() * 100);
+
+      // Add random delay before navigation
+      const preNavDelay = Math.floor(Math.random() * 2000) + 1000;
+      await page.waitForTimeout(preNavDelay);
+
       // Navigate to search page
-      console.log(`  🔍 Loading: ${url}`);
+      console.log(`  🔍 [CHROMIUM] Loading search page: ${url}`);
       await page.goto(url, {
         waitUntil: "domcontentloaded",
         timeout: 30000,
       });
+
+      // Simulate human-like mouse movements after page load
+      await page.mouse.move(
+        Math.floor(Math.random() * 200) + 100,
+        Math.floor(Math.random() * 200) + 100
+      );
+      await page.waitForTimeout(Math.random() * 500 + 200);
 
       // Wait for content
       await page
@@ -94,6 +383,70 @@ class BatchCrawler {
         .catch(() => {
           console.log("  ⏳ Network still active, continuing...");
         });
+
+      // Capture screenshot BEFORE Cloudflare check
+      try {
+        const testDir = path.join(process.cwd(), "test");
+        if (!fs.existsSync(testDir)) {
+          fs.mkdirSync(testDir, { recursive: true });
+        }
+
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const urlSlug = url.split("/").filter(Boolean).slice(-2).join("-").replace(/[^a-zA-Z0-9-]/g, "_");
+        const screenshotPath = path.join(testDir, `search-before-cf-${urlSlug}-${timestamp}.png`);
+
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`  📸 Screenshot before CF check: ${screenshotPath}`);
+      } catch (screenshotError) {
+        console.log(`  ⚠️  Screenshot before CF failed: ${screenshotError.message}`);
+      }
+
+      // Check for Cloudflare with enhanced handling
+      const pageTitle = await page.title();
+      if (pageTitle.includes("Just a moment") || pageTitle.includes("Attention Required")) {
+        console.log("  ⚠️  Cloudflare detected, simulating human behavior...");
+
+        for (let i = 0; i < 5; i++) {
+          await page.mouse.move(
+            Math.floor(Math.random() * 500) + 200,
+            Math.floor(Math.random() * 500) + 200
+          );
+          await page.waitForTimeout(1000);
+
+          await page.evaluate(() => {
+            window.scrollBy(0, Math.floor(Math.random() * 50));
+          });
+
+          await page.waitForTimeout(Math.random() * 2000 + 2000);
+
+          const newTitle = await page.title();
+          if (!newTitle.includes("Just a moment") && !newTitle.includes("Attention Required")) {
+            console.log("  ✓ Cloudflare challenge passed!");
+            break;
+          }
+
+          if (i < 4) {
+            console.log(`  ⏳ Still solving... (${i + 2}/5)`);
+          }
+        }
+      }
+
+      // Capture screenshot AFTER Cloudflare check
+      try {
+        const testDir = path.join(process.cwd(), "test");
+        if (!fs.existsSync(testDir)) {
+          fs.mkdirSync(testDir, { recursive: true });
+        }
+
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const urlSlug = url.split("/").filter(Boolean).slice(-2).join("-").replace(/[^a-zA-Z0-9-]/g, "_");
+        const screenshotPath = path.join(testDir, `search-after-cf-${urlSlug}-${timestamp}.png`);
+
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`  📸 Screenshot after CF check: ${screenshotPath}`);
+      } catch (screenshotError) {
+        console.log(`  ⚠️  Screenshot after CF failed: ${screenshotError.message}`);
+      }
 
       // Wait for study links to appear
       try {
@@ -130,27 +483,100 @@ class BatchCrawler {
 
   /**
    * Scrape a single study page
+   * Uses WEBKIT browser for better Cloudflare evasion
    */
   async scrapeStudyPage(url, countryLabel, portalType, countryKey) {
-    const page = await this.context.newPage();
+    const page = await this.webkitContext.newPage();
 
     try {
+      // Add page-level stealth
+      await page.addInitScript(() => {
+        delete navigator.__proto__.webdriver;
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
+          configurable: true,
+        });
+        Object.defineProperty(window, 'navigator', {
+          value: new Proxy(navigator, {
+            has: (target, key) => (key === 'webdriver' ? false : key in target),
+            get: (target, key) => (key === 'webdriver' ? undefined : target[key]),
+          }),
+        });
+        Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+        Object.defineProperty(screen, 'availHeight', { get: () => 1080 });
+        Object.defineProperty(window, 'outerWidth', { get: () => 1920 });
+        Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
+      });
+
       // Apply currency context
       await applyCurrencyByCountryContext(page, countryKey);
 
+      // Simulate human behavior before navigation
+      await page.mouse.move(Math.random() * 100, Math.random() * 100);
+
+      // Add random delay before navigation
+      const preNavDelay = Math.floor(Math.random() * 2000) + 1000;
+      await page.waitForTimeout(preNavDelay);
+
       // Navigate to study page
+      console.log(`  🌐 [WEBKIT] Loading study page with stealth...`);
       await page.goto(url, {
         waitUntil: "domcontentloaded",
         timeout: 30000,
       });
 
+      // Simulate human-like mouse movements after page load
+      await page.mouse.move(
+        Math.floor(Math.random() * 200) + 100,
+        Math.floor(Math.random() * 200) + 100
+      );
+      await page.waitForTimeout(Math.random() * 500 + 200);
+
       await page
         .waitForLoadState("networkidle", { timeout: 15000 })
         .catch(() => {});
 
+      // Check for Cloudflare with enhanced handling
+      const pageTitle = await page.title();
+      if (pageTitle.includes("Just a moment") || pageTitle.includes("Attention Required")) {
+        console.log("  ⚠️  Cloudflare detected on study page, simulating human behavior...");
+
+        for (let i = 0; i < 5; i++) {
+          await page.mouse.move(
+            Math.floor(Math.random() * 500) + 200,
+            Math.floor(Math.random() * 500) + 200
+          );
+          await page.waitForTimeout(1000);
+
+          await page.evaluate(() => {
+            window.scrollBy(0, Math.floor(Math.random() * 50));
+          });
+
+          await page.waitForTimeout(Math.random() * 2000 + 2000);
+
+          const newTitle = await page.title();
+          if (!newTitle.includes("Just a moment") && !newTitle.includes("Attention Required")) {
+            console.log("  ✓ Cloudflare challenge passed!");
+            break;
+          }
+
+          if (i < 4) {
+            console.log(`  ⏳ Still solving challenge... (${i + 2}/5)`);
+          } else {
+            console.log("  ❌ Cloudflare not resolved after 5 attempts");
+          }
+        }
+      }
+
       // Wait for main content
-      await page.waitForSelector("#Hero", { timeout: 10000 });
-      await page.waitForSelector("#QuickFacts", { timeout: 10000 });
+      console.log("  ⏳ Waiting for #Hero section...");
+      await page.waitForSelector("#Hero", { timeout: 30000 });
+      console.log("  ✓ #Hero loaded");
+
+      console.log("  ⏳ Waiting for #QuickFacts section...");
+      await page.waitForSelector("#QuickFacts", { timeout: 30000 });
+      console.log("  ✓ #QuickFacts loaded");
+
       await page.waitForTimeout(3000);
 
       // Extract data using the same logic as the original crawlers
@@ -350,7 +776,9 @@ class BatchCrawler {
             countryKey
           );
 
-          console.log(`  ✓ Found ${result.studyUrls.length} study URLs on this page`);
+          console.log(
+            `  ✓ Found ${result.studyUrls.length} study URLs on this page`
+          );
 
           // Filter out already scraped URLs
           const countryState = this.stateManager.getCountryState(
@@ -365,24 +793,34 @@ class BatchCrawler {
 
           // STEP 2: Immediately scrape each study page from this search page
           if (newUrls.length > 0) {
-            console.log(`\n  📚 Scraping ${newUrls.length} study pages from this search page...`);
+            console.log(
+              `\n  📚 Scraping ${newUrls.length} study pages from this search page...`
+            );
 
             for (let i = 0; i < newUrls.length; i++) {
               const url = newUrls[i];
               totalStudiesScraped++;
 
               console.log(
-                `\n  [${i + 1}/${newUrls.length}] (Total: ${totalStudiesScraped}) ${url.substring(
-                  0,
-                  70
-                )}...`
+                `\n  [${i + 1}/${
+                  newUrls.length
+                }] (Total: ${totalStudiesScraped}) ${url.substring(0, 70)}...`
               );
 
               try {
-                await this.scrapeStudyPage(url, countryLabel, portalType, countryKey);
+                await this.scrapeStudyPage(
+                  url,
+                  countryLabel,
+                  portalType,
+                  countryKey
+                );
 
                 // Mark as scraped
-                this.stateManager.markStudyUrlScraped(countryLabel, portalType, url);
+                this.stateManager.markStudyUrlScraped(
+                  countryLabel,
+                  portalType,
+                  url
+                );
 
                 // Update count
                 const currentCount = this.stateManager.getCountryState(
@@ -393,7 +831,9 @@ class BatchCrawler {
                   programsExtracted: currentCount + 1,
                 });
 
-                console.log(`  ✓ Extracted successfully (${totalStudiesScraped} total)`);
+                console.log(
+                  `  ✓ Extracted successfully (${totalStudiesScraped} total)`
+                );
 
                 // Delay before next study page
                 const delay = this.config.requestDelay + Math.random() * 1000;
@@ -402,11 +842,17 @@ class BatchCrawler {
                 console.error(`  ❌ Error:`, error.message);
 
                 // Mark as scraped anyway to avoid retrying forever
-                this.stateManager.markStudyUrlScraped(countryLabel, portalType, url);
+                this.stateManager.markStudyUrlScraped(
+                  countryLabel,
+                  portalType,
+                  url
+                );
               }
             }
 
-            console.log(`\n  ✓ Completed scraping all studies from page ${currentPageNum}`);
+            console.log(
+              `\n  ✓ Completed scraping all studies from page ${currentPageNum}`
+            );
           } else {
             console.log(`  ℹ️  All URLs from this page were already scraped`);
           }
@@ -542,7 +988,8 @@ class BatchCrawler {
   }
 }
 
-// Run the crawler
+// Run the crawler with dual browser setup
+// Chromium for search pages, WebKit for study pages
 const crawler = new BatchCrawler({
   headless: true,
   requestDelay: 3000,

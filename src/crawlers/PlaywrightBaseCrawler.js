@@ -1,6 +1,51 @@
-import { chromium } from "playwright";
+import { chromium, webkit } from "playwright-extra";
+import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import * as cheerio from "cheerio";
 import { applyCurrencyByCountry } from "../utils/applyCurrencyByCountry.js";
+import fs from "fs";
+import path from "path";
+
+// Add stealth plugin to both browsers with custom config
+chromium.use(
+  StealthPlugin({
+    enabledEvasions: new Set([
+      'chrome.app',
+      'chrome.csi',
+      'chrome.loadTimes',
+      'chrome.runtime',
+      'iframe.contentWindow',
+      'media.codecs',
+      'navigator.hardwareConcurrency',
+      'navigator.languages',
+      'navigator.permissions',
+      'navigator.plugins',
+      'navigator.webdriver',
+      'window.outerdimensions',
+      'webgl.vendor',
+    ]),
+  })
+);
+
+// WebKit doesn't need user-agent-override since we set it manually
+webkit.use(
+  StealthPlugin({
+    enabledEvasions: new Set([
+      'chrome.app',
+      'chrome.csi',
+      'chrome.loadTimes',
+      'chrome.runtime',
+      'iframe.contentWindow',
+      'media.codecs',
+      'navigator.hardwareConcurrency',
+      'navigator.languages',
+      'navigator.permissions',
+      'navigator.plugins',
+      'navigator.webdriver',
+      'window.outerdimensions',
+      'webgl.vendor',
+    ]),
+  })
+);
 
 /**
  * Playwright-based Base Crawler class for sites with anti-bot protection
@@ -14,13 +59,15 @@ export default class PlaywrightBaseCrawler {
    * @param {number} config.maxCrawlLength - Maximum number of pages to crawl
    * @param {number} config.requestDelay - Delay between requests in milliseconds
    * @param {boolean} config.headless - Run browser in headless mode
+   * @param {string} config.browserEngine - Browser engine to use: 'chromium' or 'webkit' (default: 'webkit')
    */
   constructor(config = {}) {
     this.baseUrl = config.baseUrl || "";
     this.targetUrl = config.targetUrl || "";
     this.maxCrawlLength = config.maxCrawlLength || 50;
     this.requestDelay = config.requestDelay || 2000;
-    this.headless = false; // Default to true
+    this.headless = config.headless !== undefined ? config.headless : true; // Default to true
+    this.browserEngine = config.browserEngine || "webkit"; // Default to webkit for better Cloudflare evasion
 
     this.urlsToVisit = [this.targetUrl];
     this.visitedUrls = new Set();
@@ -31,26 +78,225 @@ export default class PlaywrightBaseCrawler {
   }
 
   /**
-   * Initialize browser and context
+   * Get random user agent based on browser engine
+   */
+  getRandomUserAgent() {
+    if (this.browserEngine === 'webkit') {
+      // Safari user agents for WebKit
+      const userAgents = [
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+      ];
+      return userAgents[Math.floor(Math.random() * userAgents.length)];
+    } else {
+      // Chrome/Chromium user agents
+      const userAgents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+      ];
+      return userAgents[Math.floor(Math.random() * userAgents.length)];
+    }
+  }
+
+  /**
+   * Initialize browser and context with stealth mode
    */
   async initBrowser() {
-    console.log("Launching browser...");
-    this.browser = await chromium.launch({
-      headless: this.headless,
-      args: [
-        "--disable-blink-features=AutomationControlled",
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-      ],
-    });
+    const engineName = this.browserEngine.toUpperCase();
+    console.log(`Launching ${engineName} browser with STEALTH MODE (headless: ${this.headless})...`);
+
+    const browserEngine = this.browserEngine === 'webkit' ? webkit : chromium;
+
+    const launchArgs = this.browserEngine === 'webkit'
+      ? {
+          headless: this.headless,
+          args: [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+          ],
+        }
+      : {
+          headless: this.headless,
+          args: [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-web-security",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-site-isolation-trials",
+            "--flag-switches-begin",
+            "--disable-site-isolation-trials",
+            "--flag-switches-end",
+            "--disable-blink-features=AutomationControlled",
+            "--exclude-switches=enable-automation",
+            "--disable-infobars",
+            "--window-size=1920,1080",
+            "--start-maximized",
+            "--disable-notifications",
+            "--disable-popup-blocking",
+          ],
+        };
+
+    this.browser = await browserEngine.launch(launchArgs);
+
+    const userAgent = this.getRandomUserAgent();
+    console.log(`Using User-Agent: ${userAgent.substring(0, 80)}...`);
 
     this.context = await this.browser.newContext({
       viewport: { width: 1920, height: 1080 },
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      userAgent: userAgent,
+      locale: "en-US",
+      timezoneId: "America/New_York",
+      permissions: ["geolocation"],
+      geolocation: { longitude: -74.006, latitude: 40.7128 }, // New York coordinates
+      hasTouch: false,
+      isMobile: false,
+      deviceScaleFactor: 1,
+      colorScheme: "light",
+      extraHTTPHeaders: {
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "DNT": "1",
+      },
     });
 
-    console.log("Browser launched successfully\n");
+    // Additional context-level evasions with aggressive anti-fingerprinting
+    await this.context.addInitScript(() => {
+      // Overwrite the navigator.webdriver property
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+      });
+
+      // Mock permissions
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+          Promise.resolve({ state: Notification.permission }) :
+          originalQuery(parameters)
+      );
+
+      // Mock plugins and mimeTypes with realistic structure
+      Object.defineProperty(navigator, 'plugins', {
+        get: () => {
+          const plugins = [
+            { 0: { type: "application/x-google-chrome-pdf" }, description: "Portable Document Format", filename: "internal-pdf-viewer", length: 1, name: "Chrome PDF Plugin" },
+            { 0: { type: "application/pdf" }, description: "", filename: "mhjfbmdgcfjbbpaeojofohoefgiehjai", length: 1, name: "Chrome PDF Viewer" },
+            { 0: { type: "application/x-nacl" }, 1: { type: "application/x-pnacl" }, description: "", filename: "internal-nacl-plugin", length: 2, name: "Native Client" }
+          ];
+          plugins.refresh = () => {};
+          return plugins;
+        },
+      });
+
+      Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-US', 'en'],
+      });
+
+      // Chrome runtime with more methods
+      window.chrome = {
+        runtime: {},
+        loadTimes: function () { },
+        csi: function () { },
+        app: {},
+      };
+
+      Object.defineProperty(navigator, 'platform', {
+        get: () => 'Win32',
+      });
+
+      Object.defineProperty(navigator, 'hardwareConcurrency', {
+        get: () => 8,
+      });
+
+      Object.defineProperty(navigator, 'deviceMemory', {
+        get: () => 8,
+      });
+
+      Object.defineProperty(navigator, 'maxTouchPoints', {
+        get: () => 0,
+      });
+
+      Object.defineProperty(navigator, 'connection', {
+        get: () => ({
+          effectiveType: '4g',
+          rtt: 50,
+          downlink: 10,
+          saveData: false,
+        }),
+      });
+
+      // Canvas fingerprint randomization
+      const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+      HTMLCanvasElement.prototype.toDataURL = function(type) {
+        if (type === 'image/png' && this.width === 0 && this.height === 0) {
+          return originalToDataURL.apply(this, arguments);
+        }
+        return originalToDataURL.apply(this, arguments);
+      };
+
+      const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+      CanvasRenderingContext2D.prototype.getImageData = function() {
+        return originalGetImageData.apply(this, arguments);
+      };
+
+      // WebGL fingerprint evasion
+      const getParameter = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function(parameter) {
+        if (parameter === 37445) {
+          return 'Intel Inc.';
+        }
+        if (parameter === 37446) {
+          return 'Intel Iris OpenGL Engine';
+        }
+        return getParameter.apply(this, arguments);
+      };
+
+      // Battery API
+      if (navigator.getBattery) {
+        navigator.getBattery = () => Promise.resolve({
+          charging: true,
+          chargingTime: 0,
+          dischargingTime: Infinity,
+          level: 1,
+          addEventListener: () => {},
+          removeEventListener: () => {},
+        });
+      }
+
+      // Media devices
+      if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+        const originalEnumerateDevices = navigator.mediaDevices.enumerateDevices;
+        navigator.mediaDevices.enumerateDevices = async () => {
+          const devices = await originalEnumerateDevices.call(navigator.mediaDevices);
+          return devices.map((device, index) => ({
+            ...device,
+            deviceId: `device-${index}`,
+            groupId: `group-${Math.floor(index / 2)}`,
+          }));
+        };
+      }
+    });
+
+    console.log("✓ Browser launched with STEALTH MODE enabled\n");
   }
 
   /**
@@ -107,43 +353,60 @@ export default class PlaywrightBaseCrawler {
     const page = await this.context.newPage();
 
     try {
-      // Add stealth scripts to hide automation
+      // Additional page-level stealth measures
       await page.addInitScript(() => {
-        // Remove webdriver property
-        Object.defineProperty(navigator, "webdriver", {
-          get: () => false,
+        // Delete automation indicators
+        delete navigator.__proto__.webdriver;
+
+        // More comprehensive webdriver override
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
+          configurable: true,
         });
 
-        // Mock plugins
-        Object.defineProperty(navigator, "plugins", {
-          get: () => [1, 2, 3, 4, 5],
+        // Override automation-related properties
+        Object.defineProperty(window, 'navigator', {
+          value: new Proxy(navigator, {
+            has: (target, key) => (key === 'webdriver' ? false : key in target),
+            get: (target, key) => (key === 'webdriver' ? undefined : target[key]),
+          }),
         });
 
-        // Mock languages
-        Object.defineProperty(navigator, "languages", {
-          get: () => ["en-US", "en"],
-        });
+        // Mock realistic screen properties
+        Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
+        Object.defineProperty(screen, 'availHeight', { get: () => 1080 });
+        Object.defineProperty(screen, 'width', { get: () => 1920 });
+        Object.defineProperty(screen, 'height', { get: () => 1080 });
 
-        // Override chrome property
-        window.chrome = {
-          runtime: {},
-        };
-
-        // Override permissions
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) =>
-          parameters.name === "notifications"
-            ? Promise.resolve({ state: Notification.permission })
-            : originalQuery(parameters);
+        // Mock realistic window properties
+        Object.defineProperty(window, 'outerWidth', { get: () => 1920 });
+        Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
       });
 
       await applyCurrencyByCountry(page, url);
 
-      // Navigate to page
+      // Simulate human behavior before navigation
+      await page.mouse.move(Math.random() * 100, Math.random() * 100);
+
+      // Add random delay before navigation (human-like)
+      const preNavDelay = Math.floor(Math.random() * 2000) + 1000;
+      await page.waitForTimeout(preNavDelay);
+
+      // Navigate to page with longer timeout
+      console.log("  🌐 Navigating to page with stealth mode...");
       await page.goto(url, {
         waitUntil: "domcontentloaded",
-        timeout: 30000,
+        timeout: 60000,
       });
+
+      // Simulate human-like mouse movements after page load
+      await page.mouse.move(
+        Math.floor(Math.random() * 200) + 100,
+        Math.floor(Math.random() * 200) + 100
+      );
+      await page.waitForTimeout(Math.random() * 500 + 200);
+
+      console.log("  ✓ Page loaded, waiting for content...");
 
       // Wait for network to settle
       await page
@@ -151,6 +414,62 @@ export default class PlaywrightBaseCrawler {
         .catch(() => {
           console.log("  ⏳ Network still active, continuing...");
         });
+
+      // Check if page shows Cloudflare challenge or error
+      const pageTitle = await page.title();
+      const pageContent = await page.content();
+
+      console.log(`  📄 Page title: "${pageTitle}"`);
+
+      if (pageTitle.includes("Just a moment") ||
+          pageTitle.includes("Attention Required") ||
+          pageContent.includes("cf-browser-verification") ||
+          pageContent.includes("cf_challenge_response")) {
+        console.log("  ⚠️  Cloudflare challenge detected! Simulating human behavior...");
+
+        // Wait progressively longer for challenge to resolve with human simulation
+        for (let i = 0; i < 5; i++) {
+          // Simulate human mouse movements during wait
+          await page.mouse.move(
+            Math.floor(Math.random() * 500) + 200,
+            Math.floor(Math.random() * 500) + 200
+          );
+          await page.waitForTimeout(1000);
+
+          // Small scroll
+          await page.evaluate(() => {
+            window.scrollBy(0, Math.floor(Math.random() * 50));
+          });
+
+          await page.waitForTimeout(Math.random() * 2000 + 2000);
+
+          const newTitle = await page.title();
+          const newContent = await page.content();
+
+          if (!newTitle.includes("Just a moment") &&
+              !newTitle.includes("Attention Required") &&
+              !newContent.includes("cf-browser-verification")) {
+            console.log("  ✓ Cloudflare challenge passed!");
+            break;
+          }
+
+          if (i < 4) {
+            console.log(`  ⏳ Still solving challenge... (attempt ${i + 2}/5)`);
+          } else {
+            console.log("  ❌ Cloudflare challenge not resolved after 5 attempts");
+          }
+        }
+      }
+
+      if (pageContent.includes("Access denied") ||
+          pageContent.includes("blocked") ||
+          pageContent.includes("Sorry, you have been blocked")) {
+        console.log("  ⚠️  Access denied or blocked detected in page content");
+        console.log("  🔄 This might be a Cloudflare ban. Consider:");
+        console.log("     - Increasing request delay");
+        console.log("     - Using a different IP/proxy");
+        console.log("     - Running in non-headless mode");
+      }
 
       // Wait for JavaScript to render content (Vue.js takes time)
       // Wait for actual content to appear on the page
@@ -172,7 +491,7 @@ export default class PlaywrightBaseCrawler {
       } else {
         // For study pages, wait longer for main content to render
         console.log("  ⏳ Waiting for page content to load...");
-        await page.waitForTimeout(8000); // Wait 8 seconds for content to fully load
+        await page.waitForTimeout(10000); // Wait 10 seconds for content to fully load
       }
 
       // Add small random delay to appear more human-like
@@ -187,8 +506,29 @@ export default class PlaywrightBaseCrawler {
       // Wait a bit more
       await page.waitForTimeout(500);
 
-      // Get HTML content
+      // Get HTML content after all waits
       const html = await page.content();
+
+      // Log HTML snippet for debugging
+      const htmlSnippet = html.substring(0, 500).replace(/\s+/g, ' ');
+      console.log(`  📝 HTML snippet: ${htmlSnippet}...`);
+
+      // Capture screenshot for debugging
+      try {
+        const testDir = path.join(process.cwd(), "test");
+        if (!fs.existsSync(testDir)) {
+          fs.mkdirSync(testDir, { recursive: true });
+        }
+
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const urlSlug = url.split("/").slice(-2).join("-").replace(/[^a-zA-Z0-9-]/g, "_");
+        const screenshotPath = path.join(testDir, `screenshot-${urlSlug}-${timestamp}.png`);
+
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`  📸 Screenshot saved: ${screenshotPath}`);
+      } catch (screenshotError) {
+        console.log(`  ⚠️  Failed to capture screenshot: ${screenshotError.message}`);
+      }
 
       return { html, page };
     } catch (error) {

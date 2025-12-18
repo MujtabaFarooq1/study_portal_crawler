@@ -1,5 +1,7 @@
 import PlaywrightBaseCrawler from "./PlaywrightBaseCrawler.js";
 import { appendToCSV } from "../utils/csvWriter.js";
+import fs from "fs";
+import path from "path";
 
 /**
  * Bachelors Portal crawler using Playwright (browser automation)
@@ -47,9 +49,49 @@ export default class BachelorsPortalPlaywrightCrawler extends PlaywrightBaseCraw
     console.log("  Extracting detailed bachelor study page data...");
 
     try {
-      await page.waitForSelector("#Hero", { timeout: 10000 });
-      await page.waitForSelector("#QuickFacts", { timeout: 10000 });
-      await page.waitForTimeout(2000);
+      // Capture screenshot BEFORE waiting for selectors to debug what's on the page
+      try {
+        const testDir = path.join(process.cwd(), "test");
+        if (!fs.existsSync(testDir)) {
+          fs.mkdirSync(testDir, { recursive: true });
+        }
+
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const urlSlug = url.split("/").filter(Boolean).slice(-2).join("-").replace(/[^a-zA-Z0-9-]/g, "_");
+        const screenshotPath = path.join(testDir, `before-extraction-${urlSlug}-${timestamp}.png`);
+
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`  📸 Pre-extraction screenshot: ${screenshotPath}`);
+      } catch (screenshotError) {
+        console.log(`  ⚠️  Pre-extraction screenshot failed: ${screenshotError.message}`);
+      }
+
+      console.log("  ⏳ Waiting for #Hero section...");
+      await page.waitForSelector("#Hero", { timeout: 30000 });
+      console.log("  ✓ #Hero loaded");
+
+      console.log("  ⏳ Waiting for #QuickFacts section...");
+      await page.waitForSelector("#QuickFacts", { timeout: 30000 });
+      console.log("  ✓ #QuickFacts loaded");
+
+      await page.waitForTimeout(3000);
+
+      // Capture screenshot of successfully loaded study page
+      try {
+        const testDir = path.join(process.cwd(), "test");
+        if (!fs.existsSync(testDir)) {
+          fs.mkdirSync(testDir, { recursive: true });
+        }
+
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const urlSlug = url.split("/").filter(Boolean).slice(-2).join("-").replace(/[^a-zA-Z0-9-]/g, "_");
+        const screenshotPath = path.join(testDir, `bachelor-study-${urlSlug}-${timestamp}.png`);
+
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+        console.log(`  📸 Bachelor study screenshot: ${screenshotPath}`);
+      } catch (screenshotError) {
+        console.log(`  ⚠️  Screenshot failed: ${screenshotError.message}`);
+      }
 
       const data = await page.evaluate(() => {
         const result = {};
