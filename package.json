@@ -8,7 +8,10 @@
     "test": "node test-country-crawler.js",
     "crawl:all": "node crawl-all-countries.js",
     "crawl:single": "node crawl-single-country.js",
-    "crawl:test": "node test-country-crawler.js"
+    "crawl:test": "node test-country-crawler.js",
+    "crawl:batch": "node crawl-batch.js",
+    "progress": "node show-progress.js",
+    "reset": "node reset-state.js"
   },
   "author": "",
   "license": "ISC",

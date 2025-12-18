@@ -119,3 +119,4 @@ examples/*-results.json
 
 # Ignore all output generated
 output/
+crawler-state.json
