@@ -329,9 +329,30 @@ class BatchCrawler {
   /**
    * Crawl a single search page and extract study URLs
    * Uses CHROMIUM browser for faster search page processing
+   * Falls back to WEBKIT if Cloudflare blocks Chromium
    */
   async crawlSearchPage(url, countryLabel, portalType, countryKey) {
-    const page = await this.chromiumContext.newPage();
+    // Try Chromium first
+    try {
+      return await this._crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, 'chromium');
+    } catch (error) {
+      // If Chromium fails with Cloudflare, wait 5 seconds then try WebKit
+      if (error.message && error.message.includes('Cloudflare')) {
+        console.log("  🔄 Chromium blocked by Cloudflare, waiting 5 seconds before switching to WebKit...");
+        await this.delay(5000);
+        return await this._crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, 'webkit');
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Internal method to crawl search page with specific browser
+   */
+  async _crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, browserType) {
+    const context = browserType === 'chromium' ? this.chromiumContext : this.webkitContext;
+    const browserName = browserType.toUpperCase();
+    const page = await context.newPage();
 
     try {
       // Add page-level stealth
@@ -364,7 +385,7 @@ class BatchCrawler {
       await page.waitForTimeout(preNavDelay);
 
       // Navigate to search page
-      console.log(`  🔍 [CHROMIUM] Loading search page: ${url}`);
+      console.log(`  🔍 [${browserName}] Loading search page: ${url}`);
       await page.goto(url, {
         waitUntil: "domcontentloaded",
         timeout: 30000,
@@ -403,9 +424,12 @@ class BatchCrawler {
 
       // Check for Cloudflare with enhanced handling
       const pageTitle = await page.title();
+      const pageContent = await page.content();
+
       if (pageTitle.includes("Just a moment") || pageTitle.includes("Attention Required")) {
         console.log("  ⚠️  Cloudflare detected, simulating human behavior...");
 
+        let cloudflareResolved = false;
         for (let i = 0; i < 5; i++) {
           await page.mouse.move(
             Math.floor(Math.random() * 500) + 200,
@@ -422,6 +446,7 @@ class BatchCrawler {
           const newTitle = await page.title();
           if (!newTitle.includes("Just a moment") && !newTitle.includes("Attention Required")) {
             console.log("  ✓ Cloudflare challenge passed!");
+            cloudflareResolved = true;
             break;
           }
 
@@ -429,6 +454,55 @@ class BatchCrawler {
             console.log(`  ⏳ Still solving... (${i + 2}/5)`);
           }
         }
+
+        // If Cloudflare wasn't resolved after 5 attempts, save HTML and throw error
+        if (!cloudflareResolved) {
+          // Save HTML for investigation
+          try {
+            const testDir = path.join(process.cwd(), "test");
+            if (!fs.existsSync(testDir)) {
+              fs.mkdirSync(testDir, { recursive: true });
+            }
+
+            const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+            const urlSlug = url.split("/").filter(Boolean).slice(-2).join("-").replace(/[^a-zA-Z0-9-]/g, "_");
+            const htmlPath = path.join(testDir, `search-error-${browserName.toLowerCase()}-${urlSlug}-${timestamp}.html`);
+
+            const finalContent = await page.content();
+            fs.writeFileSync(htmlPath, finalContent);
+            console.log(`  💾 Saved error HTML: ${htmlPath}`);
+          } catch (saveError) {
+            console.log(`  ⚠️  Failed to save HTML: ${saveError.message}`);
+          }
+
+          await page.close();
+          throw new Error(`Cloudflare challenge not resolved with ${browserName} after 5 attempts`);
+        }
+      }
+
+      // Check for access denied/blocked
+      if (pageContent.includes("Access denied") ||
+          pageContent.includes("blocked") ||
+          pageContent.includes("Sorry, you have been blocked")) {
+        // Save HTML for investigation
+        try {
+          const testDir = path.join(process.cwd(), "test");
+          if (!fs.existsSync(testDir)) {
+            fs.mkdirSync(testDir, { recursive: true });
+          }
+
+          const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+          const urlSlug = url.split("/").filter(Boolean).slice(-2).join("-").replace(/[^a-zA-Z0-9-]/g, "_");
+          const htmlPath = path.join(testDir, `search-blocked-${browserName.toLowerCase()}-${urlSlug}-${timestamp}.html`);
+
+          fs.writeFileSync(htmlPath, pageContent);
+          console.log(`  💾 Saved blocked HTML: ${htmlPath}`);
+        } catch (saveError) {
+          console.log(`  ⚠️  Failed to save HTML: ${saveError.message}`);
+        }
+
+        await page.close();
+        throw new Error(`Cloudflare blocked access with ${browserName}`);
       }
 
       // Capture screenshot AFTER Cloudflare check
@@ -448,14 +522,219 @@ class BatchCrawler {
         console.log(`  ⚠️  Screenshot after CF failed: ${screenshotError.message}`);
       }
 
-      // Wait for study links to appear
-      try {
-        await page.waitForSelector('a[href*="/studies/"]', {
-          timeout: 20000,
-          state: "attached",
-        });
-      } catch (e) {
-        console.log("  ⚠️  No study links found on this page");
+      // Wait for study links to appear - use multiple selectors for better detection
+      let studyLinksFound = false;
+      let retryAttempts = 0;
+      const maxRetries = 4;
+
+      while (!studyLinksFound && retryAttempts < maxRetries) {
+        try {
+          // Wait for the study cards container first
+          await page.waitForSelector('.SearchResultsList', {
+            timeout: 10000,
+            state: "attached",
+          });
+
+          // Scroll the page to trigger lazy loading
+          console.log("  📜 Scrolling page to trigger lazy loading...");
+          await page.evaluate(async () => {
+            // Scroll to bottom slowly to trigger lazy loading
+            const scrollHeight = document.documentElement.scrollHeight;
+            const viewportHeight = window.innerHeight;
+            const scrollSteps = 5;
+            const scrollStep = scrollHeight / scrollSteps;
+
+            for (let i = 0; i <= scrollSteps; i++) {
+              window.scrollTo(0, scrollStep * i);
+              await new Promise(resolve => setTimeout(resolve, 300));
+            }
+
+            // Scroll back to top
+            window.scrollTo(0, 0);
+          });
+
+          // Wait a bit after scrolling
+          await page.waitForTimeout(2000);
+
+          // Then wait for actual study cards with links
+          await page.waitForSelector('.SearchStudyCard[href*="/studies/"]', {
+            timeout: 15000,
+            state: "attached",
+          });
+
+          // Verify links actually exist
+          const linkCount = await page.locator('a[href*="/studies/"]').count();
+          if (linkCount > 0) {
+            studyLinksFound = true;
+            console.log(`  ✓ Study links loaded successfully (found ${linkCount} links)`);
+          } else {
+            throw new Error('No study links found despite selectors matching');
+          }
+        } catch (e) {
+          // Check if "Try again" button is present (Cloudflare detection)
+          const retryButtonExists = await page.locator('button.RetryButton').count() > 0;
+
+          if (retryButtonExists && retryAttempts < maxRetries - 1) {
+            retryAttempts++;
+            console.log(`  ⚠️  Links not loaded - detected "Try again" button (attempt ${retryAttempts}/${maxRetries})`);
+
+            // On first retry with retry button, switch to headless=false mode
+            if (retryAttempts === 1) {
+              console.log(`  🔄 Switching to HEADLESS=FALSE mode for better success...`);
+
+              // Close current page
+              await page.close();
+
+              // Launch a new visible browser for this attempt
+              const visibleBrowser = browserType === 'chromium'
+                ? await chromium.launch({
+                    headless: false,
+                    args: ["--start-maximized", "--no-sandbox", "--disable-setuid-sandbox"]
+                  })
+                : await webkit.launch({
+                    headless: false,
+                    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+                  });
+
+              const visibleUserAgent = browserType === 'chromium'
+                ? this.getChromiumUserAgent()
+                : this.getWebKitUserAgent();
+
+              const visibleContext = await visibleBrowser.newContext({
+                viewport: { width: 1920, height: 1080 },
+                userAgent: visibleUserAgent,
+              });
+
+              // Apply stealth to visible context
+              await visibleContext.addInitScript(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+              });
+
+              const visiblePage = await visibleContext.newPage();
+
+              // Apply currency context
+              await applyCurrencyByCountryContext(visiblePage, countryKey);
+
+              // Navigate to URL
+              console.log(`  🌐 Loading in visible browser...`);
+              await visiblePage.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+              await visiblePage.waitForTimeout(3000);
+
+              // Scroll the page
+              console.log("  📜 Scrolling page...");
+              await visiblePage.evaluate(async () => {
+                const scrollHeight = document.documentElement.scrollHeight;
+                const scrollSteps = 5;
+                const scrollStep = scrollHeight / scrollSteps;
+                for (let i = 0; i <= scrollSteps; i++) {
+                  window.scrollTo(0, scrollStep * i);
+                  await new Promise(resolve => setTimeout(resolve, 300));
+                }
+                window.scrollTo(0, 0);
+              });
+              await visiblePage.waitForTimeout(2000);
+
+              // Check for retry button and click it
+              const visibleRetryButton = await visiblePage.locator('button.RetryButton').count();
+              if (visibleRetryButton > 0) {
+                console.log("  🔄 Clicking 'Try again' button in visible browser...");
+                await visiblePage.click('button.RetryButton');
+                await visiblePage.waitForTimeout(5000);
+              }
+
+              // Check if links loaded
+              const visibleLinkCount = await visiblePage.locator('a[href*="/studies/"]').count();
+
+              if (visibleLinkCount > 0) {
+                console.log(`  ✓ Links loaded in visible browser! (found ${visibleLinkCount} links)`);
+
+                // Extract study URLs from visible page
+                const studyUrls = await extractStudyUrlsFromSearchPage(visiblePage);
+                const nextPageUrl = portalType === "masters"
+                  ? await getNextPageUrl(visiblePage, "https://www.mastersportal.com")
+                  : await getNextPageUrl(visiblePage, "https://www.bachelorsportal.com");
+                const currentPage = await getCurrentPageNumber(visiblePage, url);
+
+                // Close visible browser
+                await visibleContext.close();
+                await visibleBrowser.close();
+
+                return { studyUrls, nextPageUrl, currentPage };
+              } else {
+                console.log(`  ⚠️  Still no links in visible browser, will try with different browser engine...`);
+                await visibleContext.close();
+                await visibleBrowser.close();
+
+                // Close current context and throw error to trigger browser switch
+                throw new Error('Cloudflare detected - switching browser engine');
+              }
+            }
+
+            try {
+              // Wait 2 seconds before clicking
+              await page.waitForTimeout(2000);
+
+              // Click the "Try again" button
+              await page.click('button.RetryButton');
+              console.log("  🔄 Clicked 'Try again' button, waiting for links to load...");
+
+              // Wait a bit for the page to reload the content
+              await page.waitForTimeout(3000);
+            } catch (clickError) {
+              console.log(`  ⚠️  Failed to click retry button: ${clickError.message}`);
+              break;
+            }
+          } else {
+            // No retry button or max retries reached
+            console.log("  ⚠️  No study links found on this page");
+
+            // Save HTML for investigation when no study links found
+            try {
+              const testDir = path.join(process.cwd(), "test");
+              if (!fs.existsSync(testDir)) {
+                fs.mkdirSync(testDir, { recursive: true });
+              }
+
+              const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+              const urlSlug = url.split("/").filter(Boolean).slice(-2).join("-").replace(/[^a-zA-Z0-9-]/g, "_");
+              const htmlPath = path.join(testDir, `search-nolinks-${browserName.toLowerCase()}-${urlSlug}-${timestamp}.html`);
+
+              const noLinksContent = await page.content();
+              fs.writeFileSync(htmlPath, noLinksContent);
+              console.log(`  💾 Saved no-links HTML: ${htmlPath}`);
+            } catch (saveError) {
+              console.log(`  ⚠️  Failed to save HTML: ${saveError.message}`);
+            }
+
+            await page.close();
+            return { studyUrls: [], nextPageUrl: null, currentPage: 1 };
+          }
+        }
+      }
+
+      // If we exhausted all retries without success
+      if (!studyLinksFound) {
+        console.log(`  ❌ Failed to load study links after ${maxRetries} attempts`);
+
+        // Save HTML for investigation
+        try {
+          const testDir = path.join(process.cwd(), "test");
+          if (!fs.existsSync(testDir)) {
+            fs.mkdirSync(testDir, { recursive: true });
+          }
+
+          const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+          const urlSlug = url.split("/").filter(Boolean).slice(-2).join("-").replace(/[^a-zA-Z0-9-]/g, "_");
+          const htmlPath = path.join(testDir, `search-nolinks-retries-${browserName.toLowerCase()}-${urlSlug}-${timestamp}.html`);
+
+          const noLinksContent = await page.content();
+          fs.writeFileSync(htmlPath, noLinksContent);
+          console.log(`  💾 Saved no-links HTML after retries: ${htmlPath}`);
+        } catch (saveError) {
+          console.log(`  ⚠️  Failed to save HTML: ${saveError.message}`);
+        }
+
+        await page.close();
         return { studyUrls: [], nextPageUrl: null, currentPage: 1 };
       }
 
@@ -484,9 +763,30 @@ class BatchCrawler {
   /**
    * Scrape a single study page
    * Uses WEBKIT browser for better Cloudflare evasion
+   * Falls back to CHROMIUM if Cloudflare blocks WebKit
    */
   async scrapeStudyPage(url, countryLabel, portalType, countryKey) {
-    const page = await this.webkitContext.newPage();
+    // Try WebKit first
+    try {
+      return await this._scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, 'webkit');
+    } catch (error) {
+      // If WebKit fails with Cloudflare, wait 5 seconds then try Chromium
+      if (error.message && error.message.includes('Cloudflare')) {
+        console.log("  🔄 WebKit blocked by Cloudflare, waiting 5 seconds before switching to Chromium...");
+        await this.delay(5000);
+        return await this._scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, 'chromium');
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Internal method to scrape study page with specific browser
+   */
+  async _scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, browserType) {
+    const context = browserType === 'chromium' ? this.chromiumContext : this.webkitContext;
+    const browserName = browserType.toUpperCase();
+    const page = await context.newPage();
 
     try {
       // Add page-level stealth
@@ -519,7 +819,7 @@ class BatchCrawler {
       await page.waitForTimeout(preNavDelay);
 
       // Navigate to study page
-      console.log(`  🌐 [WEBKIT] Loading study page with stealth...`);
+      console.log(`  🌐 [${browserName}] Loading study page with stealth...`);
       await page.goto(url, {
         waitUntil: "domcontentloaded",
         timeout: 30000,
@@ -538,9 +838,12 @@ class BatchCrawler {
 
       // Check for Cloudflare with enhanced handling
       const pageTitle = await page.title();
+      const pageContent = await page.content();
+
       if (pageTitle.includes("Just a moment") || pageTitle.includes("Attention Required")) {
         console.log("  ⚠️  Cloudflare detected on study page, simulating human behavior...");
 
+        let cloudflareResolved = false;
         for (let i = 0; i < 5; i++) {
           await page.mouse.move(
             Math.floor(Math.random() * 500) + 200,
@@ -557,15 +860,28 @@ class BatchCrawler {
           const newTitle = await page.title();
           if (!newTitle.includes("Just a moment") && !newTitle.includes("Attention Required")) {
             console.log("  ✓ Cloudflare challenge passed!");
+            cloudflareResolved = true;
             break;
           }
 
           if (i < 4) {
             console.log(`  ⏳ Still solving challenge... (${i + 2}/5)`);
-          } else {
-            console.log("  ❌ Cloudflare not resolved after 5 attempts");
           }
         }
+
+        // If Cloudflare wasn't resolved after 5 attempts, throw error to trigger browser switch
+        if (!cloudflareResolved) {
+          await page.close();
+          throw new Error(`Cloudflare challenge not resolved with ${browserName} after 5 attempts`);
+        }
+      }
+
+      // Check for access denied/blocked
+      if (pageContent.includes("Access denied") ||
+          pageContent.includes("blocked") ||
+          pageContent.includes("Sorry, you have been blocked")) {
+        await page.close();
+        throw new Error(`Cloudflare blocked access with ${browserName}`);
       }
 
       // Wait for main content
@@ -767,9 +1083,11 @@ class BatchCrawler {
         console.log(`📄 SEARCH PAGE ${currentPageNum}`);
         console.log(`${"─".repeat(80)}`);
 
+        let result = null; // Declare result outside try block so it's accessible in catch
+
         try {
           // STEP 1: Extract study URLs from this search page
-          const result = await this.crawlSearchPage(
+          result = await this.crawlSearchPage(
             searchUrl,
             countryLabel,
             portalType,
