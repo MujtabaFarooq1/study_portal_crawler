@@ -229,11 +229,27 @@ export default class MastersPortalCountryCrawler extends PlaywrightBaseCrawler {
         let degreeType = null;
         let studyMode = null;
 
-        document.querySelectorAll(".DegreeTags .Tag").forEach((tag) => {
-          const text = tag.textContent.trim();
-          if (/Bachelor|Master|PhD|MBA|\./i.test(text)) degreeType = text;
-          if (/campus|online|distance|blended/i.test(text)) studyMode = text;
-        });
+        // Get all span tags within DegreeTags
+        const degreeTags = document.querySelectorAll('.DegreeTags span');
+
+        // First span is typically the degree type
+        if (degreeTags.length > 0) {
+          const firstTag = degreeTags[0].textContent.trim();
+          // Check if first tag is study mode or degree type
+          if (/campus|online|distance|blended/i.test(firstTag)) {
+            studyMode = firstTag;
+          } else {
+            degreeType = firstTag;
+          }
+        }
+
+        // Second span is typically study mode (if not already set)
+        if (degreeTags.length > 1 && !studyMode) {
+          const secondTag = degreeTags[1].textContent.trim();
+          if (/campus|online|distance|blended/i.test(secondTag)) {
+            studyMode = secondTag;
+          }
+        }
 
         result.degreeType = degreeType;
         result.studyMode = studyMode;

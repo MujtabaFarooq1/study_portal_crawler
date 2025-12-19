@@ -19,8 +19,8 @@ export const COUNTRY_CURRENCY_MAP = {
     currency_code: "CAD",
     url_safe_label: "canada",
   },
-  Pakistan: {
-    currency_code: "PKR",
-    url_safe_label: "pakistan",
-  },
+  // Pakistan: {
+  //   currency_code: "PKR",
+  //   url_safe_label: "pakistan",
+  // },
 };

@@ -384,12 +384,48 @@ class BatchCrawler {
       const preNavDelay = Math.floor(Math.random() * 2000) + 1000;
       await page.waitForTimeout(preNavDelay);
 
-      // Navigate to search page
+      // Navigate to search page with DNS retry logic
       console.log(`  🔍 [${browserName}] Loading search page: ${url}`);
-      await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: 30000,
-      });
+      let navigationSuccess = false;
+      let dnsRetries = 0;
+      const maxDnsRetries = 5;
+
+      while (!navigationSuccess && dnsRetries < maxDnsRetries) {
+        try {
+          await page.goto(url, {
+            waitUntil: "domcontentloaded",
+            timeout: 30000,
+          });
+          navigationSuccess = true;
+        } catch (navError) {
+          // Check if it's a DNS error or connection error
+          const isDnsError = navError.message && (
+            navError.message.includes('ERR_NAME_NOT_RESOLVED') ||
+            navError.message.includes('net::ERR_NAME_NOT_RESOLVED') ||
+            navError.message.includes('DNS') ||
+            navError.message.includes('getaddrinfo') ||
+            navError.message.includes('A server with the specified hostname could not be found') ||
+            navError.message.includes('ENOTFOUND') ||
+            navError.message.includes('ETIMEDOUT')
+          );
+
+          if (isDnsError) {
+            dnsRetries++;
+            if (dnsRetries < maxDnsRetries) {
+              console.log(`  ⚠️  DNS/Network error detected (attempt ${dnsRetries}/${maxDnsRetries}), waiting 30 seconds before retry...`);
+              console.log(`     Error details: ${navError.message.split('\n')[0]}`);
+              await this.delay(30000);
+            } else {
+              console.log(`  ❌ DNS/Network error persisted after ${maxDnsRetries} attempts`);
+              console.log(`     Final error: ${navError.message.split('\n')[0]}`);
+              throw navError;
+            }
+          } else {
+            // If it's not a DNS error, throw immediately
+            throw navError;
+          }
+        }
+      }
 
       // Simulate human-like mouse movements after page load
       await page.mouse.move(
@@ -615,9 +651,47 @@ class BatchCrawler {
               // Apply currency context
               await applyCurrencyByCountryContext(visiblePage, countryKey);
 
-              // Navigate to URL
+              // Navigate to URL with DNS retry logic
               console.log(`  🌐 Loading in visible browser...`);
-              await visiblePage.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+              let visibleNavSuccess = false;
+              let visibleDnsRetries = 0;
+              const maxVisibleDnsRetries = 5;
+
+              while (!visibleNavSuccess && visibleDnsRetries < maxVisibleDnsRetries) {
+                try {
+                  await visiblePage.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+                  visibleNavSuccess = true;
+                } catch (visibleNavError) {
+                  // Check if it's a DNS error or connection error
+                  const isDnsError = visibleNavError.message && (
+                    visibleNavError.message.includes('ERR_NAME_NOT_RESOLVED') ||
+                    visibleNavError.message.includes('net::ERR_NAME_NOT_RESOLVED') ||
+                    visibleNavError.message.includes('DNS') ||
+                    visibleNavError.message.includes('getaddrinfo') ||
+                    visibleNavError.message.includes('A server with the specified hostname could not be found') ||
+                    visibleNavError.message.includes('ENOTFOUND') ||
+                    visibleNavError.message.includes('ETIMEDOUT')
+                  );
+
+                  if (isDnsError) {
+                    visibleDnsRetries++;
+                    if (visibleDnsRetries < maxVisibleDnsRetries) {
+                      console.log(`  ⚠️  DNS/Network error in visible browser (attempt ${visibleDnsRetries}/${maxVisibleDnsRetries}), waiting 30 seconds before retry...`);
+                      console.log(`     Error details: ${visibleNavError.message.split('\n')[0]}`);
+                      await this.delay(30000);
+                    } else {
+                      console.log(`  ❌ DNS/Network error in visible browser persisted after ${maxVisibleDnsRetries} attempts`);
+                      console.log(`     Final error: ${visibleNavError.message.split('\n')[0]}`);
+                      await visibleBrowser.close();
+                      throw visibleNavError;
+                    }
+                  } else {
+                    // If it's not a DNS error, throw immediately
+                    await visibleBrowser.close();
+                    throw visibleNavError;
+                  }
+                }
+              }
               await visiblePage.waitForTimeout(3000);
 
               // Scroll the page
@@ -764,19 +838,31 @@ class BatchCrawler {
    * Scrape a single study page
    * Uses WEBKIT browser for better Cloudflare evasion
    * Falls back to CHROMIUM if Cloudflare blocks WebKit
+   * Falls back to headless=false mode if both browsers fail
    */
   async scrapeStudyPage(url, countryLabel, portalType, countryKey) {
     // Try WebKit first
     try {
       return await this._scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, 'webkit');
-    } catch (error) {
+    } catch (webkitError) {
       // If WebKit fails with Cloudflare, wait 5 seconds then try Chromium
-      if (error.message && error.message.includes('Cloudflare')) {
+      if (webkitError.message && webkitError.message.includes('Cloudflare')) {
         console.log("  🔄 WebKit blocked by Cloudflare, waiting 5 seconds before switching to Chromium...");
         await this.delay(5000);
-        return await this._scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, 'chromium');
+
+        try {
+          return await this._scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, 'chromium');
+        } catch (chromiumError) {
+          // If Chromium also fails with Cloudflare, try visible browser (headless=false)
+          if (chromiumError.message && chromiumError.message.includes('Cloudflare')) {
+            console.log("  🔄 Both browsers blocked by Cloudflare, switching to HEADLESS=FALSE mode...");
+            await this.delay(5000);
+            return await this._scrapeStudyPageWithVisibleBrowser(url, countryLabel, portalType, countryKey);
+          }
+          throw chromiumError;
+        }
       }
-      throw error;
+      throw webkitError;
     }
   }
 
@@ -818,12 +904,48 @@ class BatchCrawler {
       const preNavDelay = Math.floor(Math.random() * 2000) + 1000;
       await page.waitForTimeout(preNavDelay);
 
-      // Navigate to study page
+      // Navigate to study page with DNS retry logic
       console.log(`  🌐 [${browserName}] Loading study page with stealth...`);
-      await page.goto(url, {
-        waitUntil: "domcontentloaded",
-        timeout: 30000,
-      });
+      let studyNavSuccess = false;
+      let studyDnsRetries = 0;
+      const maxStudyDnsRetries = 5;
+
+      while (!studyNavSuccess && studyDnsRetries < maxStudyDnsRetries) {
+        try {
+          await page.goto(url, {
+            waitUntil: "domcontentloaded",
+            timeout: 30000,
+          });
+          studyNavSuccess = true;
+        } catch (studyNavError) {
+          // Check if it's a DNS error or connection error
+          const isDnsError = studyNavError.message && (
+            studyNavError.message.includes('ERR_NAME_NOT_RESOLVED') ||
+            studyNavError.message.includes('net::ERR_NAME_NOT_RESOLVED') ||
+            studyNavError.message.includes('DNS') ||
+            studyNavError.message.includes('getaddrinfo') ||
+            studyNavError.message.includes('A server with the specified hostname could not be found') ||
+            studyNavError.message.includes('ENOTFOUND') ||
+            studyNavError.message.includes('ETIMEDOUT')
+          );
+
+          if (isDnsError) {
+            studyDnsRetries++;
+            if (studyDnsRetries < maxStudyDnsRetries) {
+              console.log(`  ⚠️  DNS/Network error on study page (attempt ${studyDnsRetries}/${maxStudyDnsRetries}), waiting 30 seconds before retry...`);
+              console.log(`     Error details: ${studyNavError.message.split('\n')[0]}`);
+              await this.delay(30000);
+            } else {
+              console.log(`  ❌ DNS/Network error on study page persisted after ${maxStudyDnsRetries} attempts`);
+              console.log(`     Final error: ${studyNavError.message.split('\n')[0]}`);
+              throw studyNavError;
+            }
+          } else {
+            // If it's not a DNS error, throw immediately
+            throw studyNavError;
+          }
+        }
+      }
 
       // Simulate human-like mouse movements after page load
       await page.mouse.move(
@@ -915,12 +1037,29 @@ class BatchCrawler {
         // Degree type & study mode
         let degreeType = null;
         let studyMode = null;
-        document.querySelectorAll(".DegreeTags .Tag").forEach((tag) => {
-          const text = tag.textContent.trim();
-          if (/Bachelor|Master|PhD|MBA|B\.|BSc|BA/i.test(text))
-            degreeType = text;
-          if (/campus|online|distance|blended/i.test(text)) studyMode = text;
-        });
+
+        // Get all span tags within DegreeTags
+        const degreeTags = document.querySelectorAll('.DegreeTags span');
+
+        // First span is typically the degree type
+        if (degreeTags.length > 0) {
+          const firstTag = degreeTags[0].textContent.trim();
+          // Check if first tag is study mode or degree type
+          if (/campus|online|distance|blended/i.test(firstTag)) {
+            studyMode = firstTag;
+          } else {
+            degreeType = firstTag;
+          }
+        }
+
+        // Second span is typically study mode (if not already set)
+        if (degreeTags.length > 1 && !studyMode) {
+          const secondTag = degreeTags[1].textContent.trim();
+          if (/campus|online|distance|blended/i.test(secondTag)) {
+            studyMode = secondTag;
+          }
+        }
+
         result.degreeType = degreeType;
         result.studyMode = studyMode;
 
@@ -1027,6 +1166,261 @@ class BatchCrawler {
     } catch (error) {
       await page.close();
       throw error;
+    }
+  }
+
+  /**
+   * Scrape study page with visible browser (headless=false)
+   * Used as last resort when both headless browsers fail with Cloudflare
+   */
+  async _scrapeStudyPageWithVisibleBrowser(url, countryLabel, portalType, countryKey) {
+    // Try WebKit visible first, then Chromium visible if that fails
+    for (const browserType of ['webkit', 'chromium']) {
+      try {
+        const browserName = browserType.toUpperCase();
+        console.log(`  🌐 Trying ${browserName} in HEADLESS=FALSE mode...`);
+
+        // Launch visible browser
+        const visibleBrowser = browserType === 'chromium'
+          ? await chromium.launch({
+              headless: false,
+              args: ["--start-maximized", "--no-sandbox", "--disable-setuid-sandbox"]
+            })
+          : await webkit.launch({
+              headless: false,
+              args: ["--no-sandbox", "--disable-setuid-sandbox"]
+            });
+
+        const visibleUserAgent = browserType === 'chromium'
+          ? this.getChromiumUserAgent()
+          : this.getWebKitUserAgent();
+
+        const visibleContext = await visibleBrowser.newContext({
+          viewport: { width: 1920, height: 1080 },
+          userAgent: visibleUserAgent,
+        });
+
+        // Apply stealth to visible context
+        await visibleContext.addInitScript(() => {
+          Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        });
+
+        const visiblePage = await visibleContext.newPage();
+
+        try {
+          // Apply currency context
+          await applyCurrencyByCountryContext(visiblePage, countryKey);
+
+          // Navigate to URL with DNS retry logic
+          console.log(`  🌐 Loading study page in visible ${browserName}...`);
+          let visibleNavSuccess = false;
+          let visibleDnsRetries = 0;
+          const maxVisibleDnsRetries = 5;
+
+          while (!visibleNavSuccess && visibleDnsRetries < maxVisibleDnsRetries) {
+            try {
+              await visiblePage.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+              visibleNavSuccess = true;
+            } catch (visibleNavError) {
+              const isDnsError = visibleNavError.message && (
+                visibleNavError.message.includes('ERR_NAME_NOT_RESOLVED') ||
+                visibleNavError.message.includes('net::ERR_NAME_NOT_RESOLVED') ||
+                visibleNavError.message.includes('DNS') ||
+                visibleNavError.message.includes('getaddrinfo') ||
+                visibleNavError.message.includes('A server with the specified hostname could not be found') ||
+                visibleNavError.message.includes('ENOTFOUND') ||
+                visibleNavError.message.includes('ETIMEDOUT')
+              );
+
+              if (isDnsError) {
+                visibleDnsRetries++;
+                if (visibleDnsRetries < maxVisibleDnsRetries) {
+                  console.log(`  ⚠️  DNS/Network error in visible ${browserName} (attempt ${visibleDnsRetries}/${maxVisibleDnsRetries}), waiting 30 seconds...`);
+                  await this.delay(30000);
+                } else {
+                  console.log(`  ❌ DNS/Network error persisted in visible ${browserName}`);
+                  await visibleBrowser.close();
+                  throw visibleNavError;
+                }
+              } else {
+                await visibleBrowser.close();
+                throw visibleNavError;
+              }
+            }
+          }
+
+          await visiblePage.waitForTimeout(3000);
+
+          // Wait for main content
+          console.log("  ⏳ Waiting for #Hero section...");
+          await visiblePage.waitForSelector("#Hero", { timeout: 30000 });
+          console.log("  ✓ #Hero loaded");
+
+          console.log("  ⏳ Waiting for #QuickFacts section...");
+          await visiblePage.waitForSelector("#QuickFacts", { timeout: 30000 });
+          console.log("  ✓ #QuickFacts loaded");
+
+          await visiblePage.waitForTimeout(3000);
+
+          // Extract data
+          const data = await visiblePage.evaluate(() => {
+            const result = {};
+
+            // Hero section
+            const hero = document.querySelector("#Hero");
+            const titleWrapper = hero?.querySelector(".StudyTitleWrapper");
+
+            result.university =
+              titleWrapper
+                ?.querySelector(".OrganisationName")
+                ?.textContent.trim() || null;
+            result.courseName =
+              titleWrapper?.querySelector(".StudyTitle")?.innerText.trim() || null;
+            result.officialUniversityLink =
+              titleWrapper?.querySelector(".ProgrammeWebsiteLink")?.href || null;
+
+            // Degree type & study mode
+            let degreeType = null;
+            let studyMode = null;
+
+            const degreeTags = document.querySelectorAll('.DegreeTags span');
+
+            if (degreeTags.length > 0) {
+              const firstTag = degreeTags[0].textContent.trim();
+              if (/campus|online|distance|blended/i.test(firstTag)) {
+                studyMode = firstTag;
+              } else {
+                degreeType = firstTag;
+              }
+            }
+
+            if (degreeTags.length > 1 && !studyMode) {
+              const secondTag = degreeTags[1].textContent.trim();
+              if (/campus|online|distance|blended/i.test(secondTag)) {
+                studyMode = secondTag;
+              }
+            }
+
+            result.degreeType = degreeType;
+            result.studyMode = studyMode;
+
+            // Tuition fee
+            const fee = document.querySelector(
+              '.TuitionFeeContainer[data-target="international"]'
+            );
+            if (fee) {
+              const title = fee.querySelector(".Title")?.textContent.trim();
+              const currency = fee
+                .querySelector(".CurrencyType")
+                ?.textContent.trim();
+              const unit = fee.querySelector(".Unit")?.textContent.trim();
+              result.tuitionFee =
+                title && currency && unit ? `${title} ${currency} ${unit}` : null;
+            } else {
+              result.tuitionFee = null;
+            }
+
+            // Duration
+            result.duration =
+              document.querySelector(".js-duration")?.textContent.trim() || null;
+
+            // Start dates
+            const startDates = [];
+            document
+              .querySelectorAll(".QuickFactComponent .Label i.lnr-calendar-full")[0]
+              ?.closest(".QuickFactComponent")
+              ?.querySelectorAll("time")
+              ?.forEach((t) => startDates.push(t.textContent.trim()));
+            result.intakes = startDates;
+
+            // English requirements
+            const tests = new Map();
+            document
+              .querySelectorAll(
+                "#EnglishRequirements .CardContents.EnglishCardContents"
+              )
+              .forEach((card) => {
+                const name = card
+                  .querySelector(".Heading")
+                  ?.textContent.replace(/\s+/g, " ")
+                  .trim();
+                const score =
+                  card
+                    .querySelector(".Score span")
+                    ?.textContent.replace(/[^0-9.]/g, "")
+                    .trim() || null;
+                if (name && !tests.has(name)) {
+                  tests.set(name, score);
+                }
+              });
+            result.languageRequirements = Object.fromEntries(tests);
+
+            // General requirements
+            const reqs = [];
+            document
+              .querySelectorAll("#OtherRequirements h3 + ul li")
+              .forEach((li) => reqs.push(li.textContent.trim()));
+            result.generalRequirements = reqs.length ? reqs : null;
+
+            // Country/location
+            document
+              .querySelectorAll("#QuickFacts .QuickFactComponent")
+              .forEach((comp) => {
+                if (comp.textContent.includes("Campus location")) {
+                  result.country =
+                    comp.querySelector(".Value")?.textContent.trim() || null;
+                }
+              });
+
+            return result;
+          });
+
+          // Add metadata
+          const fullData = {
+            ...data,
+            sourceUrl: url,
+            portal:
+              portalType === "masters"
+                ? "mastersportal.com"
+                : "bachelorsportal.com",
+            extractedAt: new Date().toISOString(),
+          };
+
+          // Save to CSV
+          appendToCountryCSV(
+            {
+              ...fullData,
+              intakes: fullData.intakes?.join(", ") || "",
+              languageRequirements: JSON.stringify(
+                fullData.languageRequirements || {}
+              ),
+              generalRequirements: Array.isArray(fullData.generalRequirements)
+                ? fullData.generalRequirements.join(" | ")
+                : fullData.generalRequirements || "",
+            },
+            portalType,
+            countryLabel
+          );
+
+          console.log(`  ✓ Successfully scraped with visible ${browserName}`);
+          await visibleBrowser.close();
+          return fullData;
+
+        } catch (error) {
+          console.log(`  ❌ Visible ${browserName} failed: ${error.message.split('\n')[0]}`);
+          await visibleBrowser.close();
+          // Try next browser type
+          if (browserType === 'chromium') {
+            throw error; // Last attempt failed
+          }
+          continue;
+        }
+
+      } catch (error) {
+        if (browserType === 'chromium') {
+          throw new Error(`All visible browser attempts failed for study page: ${url}`);
+        }
+      }
     }
   }
 
