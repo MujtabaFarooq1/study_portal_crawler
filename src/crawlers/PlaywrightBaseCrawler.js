@@ -2,6 +2,7 @@ import { chromium, webkit } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import * as cheerio from "cheerio";
 import { applyCurrencyByCountry } from "../utils/applyCurrencyByCountry.js";
+import { CaptchaSolver } from "../services/CaptchaSolver.js";
 import fs from "fs";
 import path from "path";
 
@@ -75,6 +76,9 @@ export default class PlaywrightBaseCrawler {
     this.extractedData = [];
     this.browser = null;
     this.context = null;
+
+    // Initialize captcha solver
+    this.captchaSolver = new CaptchaSolver();
   }
 
   /**
@@ -421,44 +425,38 @@ export default class PlaywrightBaseCrawler {
 
       console.log(`  📄 Page title: "${pageTitle}"`);
 
-      if (pageTitle.includes("Just a moment") ||
+      // First, try to detect and solve Turnstile captcha using 2captcha
+      const hasTurnstile = await this.captchaSolver.detectTurnstileCaptcha(page);
+
+      if (hasTurnstile) {
+        console.log("  🔐 Cloudflare Turnstile captcha detected! Attempting to solve with 2captcha...");
+
+        try {
+          const solved = await this.captchaSolver.handleTurnstileCaptcha(page);
+
+          if (solved) {
+            console.log("  ✅ Turnstile captcha bypassed successfully!");
+          } else {
+            console.log("  ⚠️  Failed to bypass Turnstile captcha, trying fallback method...");
+
+            // Fallback to old simulation method
+            await this.simulateHumanBehaviorForCloudflare(page);
+          }
+        } catch (error) {
+          console.error("  ❌ Error solving Turnstile captcha:", error.message);
+          console.log("  🔄 Falling back to human behavior simulation...");
+
+          // Fallback to old simulation method
+          await this.simulateHumanBehaviorForCloudflare(page);
+        }
+      } else if (pageTitle.includes("Just a moment") ||
           pageTitle.includes("Attention Required") ||
           pageContent.includes("cf-browser-verification") ||
           pageContent.includes("cf_challenge_response")) {
-        console.log("  ⚠️  Cloudflare challenge detected! Simulating human behavior...");
+        console.log("  ⚠️  Cloudflare challenge detected (non-Turnstile)! Simulating human behavior...");
 
-        // Wait progressively longer for challenge to resolve with human simulation
-        for (let i = 0; i < 5; i++) {
-          // Simulate human mouse movements during wait
-          await page.mouse.move(
-            Math.floor(Math.random() * 500) + 200,
-            Math.floor(Math.random() * 500) + 200
-          );
-          await page.waitForTimeout(1000);
-
-          // Small scroll
-          await page.evaluate(() => {
-            window.scrollBy(0, Math.floor(Math.random() * 50));
-          });
-
-          await page.waitForTimeout(Math.random() * 2000 + 2000);
-
-          const newTitle = await page.title();
-          const newContent = await page.content();
-
-          if (!newTitle.includes("Just a moment") &&
-              !newTitle.includes("Attention Required") &&
-              !newContent.includes("cf-browser-verification")) {
-            console.log("  ✓ Cloudflare challenge passed!");
-            break;
-          }
-
-          if (i < 4) {
-            console.log(`  ⏳ Still solving challenge... (attempt ${i + 2}/5)`);
-          } else {
-            console.log("  ❌ Cloudflare challenge not resolved after 5 attempts");
-          }
-        }
+        // Use the old simulation method for non-Turnstile challenges
+        await this.simulateHumanBehaviorForCloudflare(page);
       }
 
       if (pageContent.includes("Access denied") ||
@@ -685,6 +683,46 @@ export default class PlaywrightBaseCrawler {
    */
   delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Simulate human behavior to bypass Cloudflare challenges
+   * @param {Page} page - Playwright page object
+   * @returns {Promise<void>}
+   */
+  async simulateHumanBehaviorForCloudflare(page) {
+    // Wait progressively longer for challenge to resolve with human simulation
+    for (let i = 0; i < 5; i++) {
+      // Simulate human mouse movements during wait
+      await page.mouse.move(
+        Math.floor(Math.random() * 500) + 200,
+        Math.floor(Math.random() * 500) + 200
+      );
+      await page.waitForTimeout(1000);
+
+      // Small scroll
+      await page.evaluate(() => {
+        window.scrollBy(0, Math.floor(Math.random() * 50));
+      });
+
+      await page.waitForTimeout(Math.random() * 2000 + 2000);
+
+      const newTitle = await page.title();
+      const newContent = await page.content();
+
+      if (!newTitle.includes("Just a moment") &&
+          !newTitle.includes("Attention Required") &&
+          !newContent.includes("cf-browser-verification")) {
+        console.log("  ✓ Cloudflare challenge passed!");
+        break;
+      }
+
+      if (i < 4) {
+        console.log(`  ⏳ Still solving challenge... (attempt ${i + 2}/5)`);
+      } else {
+        console.log("  ❌ Cloudflare challenge not resolved after 5 attempts");
+      }
+    }
   }
 
   /**

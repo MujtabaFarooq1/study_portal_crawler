@@ -1,7 +1,6 @@
 import { COUNTRY_CURRENCY_MAP } from "./src/constants/country_currency_map.js";
-import MastersPortalCountryCrawler from "./src/crawlers/MastersPortalCountryCrawler.js";
-import BachelorsPortalCountryCrawler from "./src/crawlers/BachelorsPortalCountryCrawler.js";
 import StateManager from "./src/utils/stateManager.js";
+import { CaptchaSolver } from "./src/services/CaptchaSolver.js";
 import { chromium, webkit } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import {
@@ -78,6 +77,9 @@ class BatchCrawler {
     this.chromiumContext = null;
     this.webkitBrowser = null;
     this.webkitContext = null;
+
+    // Initialize captcha solver
+    this.captchaSolver = new CaptchaSolver();
   }
 
   /**
@@ -328,30 +330,80 @@ class BatchCrawler {
 
   /**
    * Crawl a single search page and extract study URLs
-   * Uses CHROMIUM browser for faster search page processing
-   * Falls back to WEBKIT if Cloudflare blocks Chromium
+   * Browser fallback order: chromium → webkit → webkit (headless=false) → chromium (headless=false)
    */
   async crawlSearchPage(url, countryLabel, portalType, countryKey) {
-    // Try Chromium first
-    try {
-      return await this._crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, 'chromium');
-    } catch (error) {
-      // If Chromium fails with Cloudflare, wait 5 seconds then try WebKit
-      if (error.message && error.message.includes('Cloudflare')) {
-        console.log("  🔄 Chromium blocked by Cloudflare, waiting 5 seconds before switching to WebKit...");
-        await this.delay(5000);
-        return await this._crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, 'webkit');
+    const fallbackOrder = [
+      { browser: 'chromium', headless: true },
+      { browser: 'webkit', headless: true },
+      { browser: 'webkit', headless: false },
+      { browser: 'chromium', headless: false }
+    ];
+
+    for (let i = 0; i < fallbackOrder.length; i++) {
+      const { browser, headless } = fallbackOrder[i];
+      const isLastAttempt = i === fallbackOrder.length - 1;
+
+      try {
+        console.log(`  🔄 Attempting with ${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'}...`);
+        return await this._crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, browser, headless);
+      } catch (error) {
+        if (isLastAttempt) {
+          // All browser configurations failed - return empty results to skip to next country
+          console.log(`  ❌ All browser configurations exhausted. No study links found on this search page.`);
+          console.log(`  ⏭️  Moving to next country/search page...`);
+          return { studyUrls: [], nextPageUrl: null, currentPage: 1 };
+        }
+        console.log(`  ⚠️  ${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'} failed: ${error.message.split('\n')[0]}`);
+        console.log(`  🔄 Switching to next browser configuration...`);
+        await this.delay(3000);
       }
-      throw error;
     }
   }
 
   /**
    * Internal method to crawl search page with specific browser
    */
-  async _crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, browserType) {
-    const context = browserType === 'chromium' ? this.chromiumContext : this.webkitContext;
+  async _crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, browserType, useHeadless = true) {
+    // If requesting non-headless mode, create a temporary browser instance
+    let tempBrowser = null;
+    let tempContext = null;
+    let context;
     const browserName = browserType.toUpperCase();
+
+    if (!useHeadless) {
+      // Launch temporary visible browser
+      tempBrowser = browserType === 'chromium'
+        ? await chromium.launch({
+            headless: false,
+            args: ["--start-maximized", "--no-sandbox", "--disable-setuid-sandbox"]
+          })
+        : await webkit.launch({
+            headless: false,
+            args: ["--no-sandbox", "--disable-setuid-sandbox"]
+          });
+
+      const userAgent = browserType === 'chromium'
+        ? this.getChromiumUserAgent()
+        : this.getWebKitUserAgent();
+
+      tempContext = await tempBrowser.newContext({
+        viewport: { width: 1920, height: 1080 },
+        userAgent: userAgent,
+        locale: "en-US",
+        timezoneId: "America/New_York",
+      });
+
+      await tempContext.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      });
+
+      context = tempContext;
+    } else {
+      // Use existing headless context
+      context = browserType === 'chromium' ? this.chromiumContext : this.webkitContext;
+    }
+
     const page = await context.newPage();
 
     try {
@@ -418,7 +470,63 @@ class BatchCrawler {
             } else {
               console.log(`  ❌ DNS/Network error persisted after ${maxDnsRetries} attempts`);
               console.log(`     Final error: ${navError.message.split('\n')[0]}`);
-              throw navError;
+              console.log(`  🔄 Switching to HEADLESS=FALSE mode to try with visible browser...`);
+
+              // Close current page
+              await page.close();
+
+              // Try with visible browser as last resort
+              const visibleBrowser = browserType === 'chromium'
+                ? await chromium.launch({
+                    headless: false,
+                    args: ["--start-maximized", "--no-sandbox", "--disable-setuid-sandbox"]
+                  })
+                : await webkit.launch({
+                    headless: false,
+                    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+                  });
+
+              const visibleUserAgent = browserType === 'chromium'
+                ? this.getChromiumUserAgent()
+                : this.getWebKitUserAgent();
+
+              const visibleContext = await visibleBrowser.newContext({
+                viewport: { width: 1920, height: 1080 },
+                userAgent: visibleUserAgent,
+              });
+
+              await visibleContext.addInitScript(() => {
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+              });
+
+              const visiblePage = await visibleContext.newPage();
+              await applyCurrencyByCountryContext(visiblePage, countryKey);
+
+              // Try loading in visible browser
+              console.log(`  🌐 Attempting to load in visible browser...`);
+              try {
+                await visiblePage.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+                console.log(`  ✅ Successfully loaded in visible browser!`);
+
+                // Give user time to solve any manual challenges
+                await visiblePage.waitForTimeout(5000);
+
+                // Extract data from visible page
+                const studyUrls = await extractStudyUrlsFromSearchPage(visiblePage);
+                const nextPageUrl = portalType === "masters"
+                  ? await getNextPageUrl(visiblePage, "https://www.mastersportal.com")
+                  : await getNextPageUrl(visiblePage, "https://www.bachelorsportal.com");
+                const currentPage = await getCurrentPageNumber(visiblePage, url);
+
+                await visibleContext.close();
+                await visibleBrowser.close();
+
+                return { studyUrls, nextPageUrl, currentPage };
+              } catch (visibleError) {
+                console.log(`  ❌ Failed even in visible browser: ${visibleError.message}`);
+                await visibleBrowser.close();
+                throw navError;
+              }
             }
           } else {
             // If it's not a DNS error, throw immediately
@@ -458,14 +566,107 @@ class BatchCrawler {
         console.log(`  ⚠️  Screenshot before CF failed: ${screenshotError.message}`);
       }
 
-      // Check for Cloudflare with enhanced handling
-      const pageTitle = await page.title();
-      const pageContent = await page.content();
+      // Check if page loaded successfully by looking for study links FIRST
+      const studyLinkCount = await page.locator('a[href*="/studies/"]').count();
+      let cloudflareResolved = false;
+      let pageTitle = '';
+      let pageContent = '';
 
-      if (pageTitle.includes("Just a moment") || pageTitle.includes("Attention Required")) {
+      if (studyLinkCount > 0) {
+        console.log(`  ✅ Page loaded successfully - found ${studyLinkCount} study links, skipping Cloudflare check`);
+        // Page loaded correctly, skip all Cloudflare detection
+        cloudflareResolved = true; // Mark as resolved to skip checks below
+      } else {
+        // Only check for Cloudflare if no study links found
+        console.log(`  ⚠️  No study links found, checking for Cloudflare challenge...`);
+
+        pageTitle = await page.title();
+        pageContent = await page.content();
+
+        // FIRST: Check if this is a Cloudflare block page (not a captcha)
+        const isBlockedPage = await page.evaluate(() => {
+          const errorHeading = document.querySelector('#cf-wrapper #cf-error-details h1');
+          return errorHeading?.innerText?.trim() === 'Sorry, you have been blocked';
+        });
+
+        if (isBlockedPage) {
+          console.log(`  🚫 Cloudflare BLOCKED this ${browserName} - switching to next browser immediately`);
+          await page.close();
+          throw new Error(`Cloudflare blocked ${browserName} - IP/browser fingerprint detected`);
+        }
+
+        // Second, try to detect and solve Turnstile captcha using 2captcha
+        const hasTurnstile = await this.captchaSolver.detectTurnstileCaptcha(page);
+
+        if (hasTurnstile) {
+        console.log("  🔐 Cloudflare Turnstile captcha detected!");
+        console.log("  🔍 Opening VISIBLE browser for investigation...");
+
+        // Close headless page (context and browser are shared, don't close them)
+        try {
+          await page.close();
+        } catch (e) {
+          console.log(`  ⚠️  Error closing headless page: ${e.message}`);
+        }
+
+        // Open visible browser immediately
+        const visibleBrowser = browserName === 'CHROMIUM'
+          ? await chromium.launch({
+              headless: false,
+              args: ["--start-maximized", "--no-sandbox", "--disable-setuid-sandbox"]
+            })
+          : await webkit.launch({
+              headless: false,
+              args: ["--no-sandbox", "--disable-setuid-sandbox"]
+            });
+
+        const visibleContext = await visibleBrowser.newContext({
+          userAgent: this.userAgent,
+          viewport: { width: 1920, height: 1080 },
+        });
+
+        const visiblePage = await visibleContext.newPage();
+
+        console.log(`  🌐 Navigating to: ${url}`);
+        await visiblePage.goto(url, {
+          waitUntil: "domcontentloaded",
+          timeout: 60000,
+        });
+
+        console.log("  ⏸️  Browser opened - you can see the captcha");
+        console.log("  🔧 Now attempting to solve captcha with 2captcha API...");
+
+        // Detect captcha again in visible browser
+        const visibleCaptchaInfo = await this.captchaSolver.detectTurnstileCaptcha(visiblePage);
+
+        if (visibleCaptchaInfo) {
+          console.log(`  🔑 Sitekey detected: ${visibleCaptchaInfo.sitekey}`);
+
+          try {
+            // Attempt to solve
+            const solved = await this.captchaSolver.handleTurnstileCaptcha(visiblePage);
+
+            if (solved) {
+              console.log("  ✅ Captcha solved successfully in visible browser!");
+              console.log("  ⏸️  Check the browser to see the result");
+            } else {
+              console.log("  ❌ Failed to solve captcha");
+            }
+          } catch (error) {
+            console.error(`  ❌ Error solving captcha: ${error.message}`);
+          }
+        }
+
+        console.log("  ⏸️  Press Ctrl+C when done investigating");
+
+        // Wait indefinitely for manual inspection
+        await new Promise(() => {}); // Never resolves - user will Ctrl+C
+      }
+
+      // If not resolved by captcha solver, or if it's a non-Turnstile challenge, use simulation
+      if (!cloudflareResolved && (pageTitle.includes("Just a moment") || pageTitle.includes("Attention Required"))) {
         console.log("  ⚠️  Cloudflare detected, simulating human behavior...");
 
-        let cloudflareResolved = false;
         for (let i = 0; i < 5; i++) {
           await page.mouse.move(
             Math.floor(Math.random() * 500) + 200,
@@ -490,30 +691,31 @@ class BatchCrawler {
             console.log(`  ⏳ Still solving... (${i + 2}/5)`);
           }
         }
+        }
+      } // End of else block for Cloudflare checking
 
-        // If Cloudflare wasn't resolved after 5 attempts, save HTML and throw error
-        if (!cloudflareResolved) {
-          // Save HTML for investigation
-          try {
-            const testDir = path.join(process.cwd(), "test");
-            if (!fs.existsSync(testDir)) {
-              fs.mkdirSync(testDir, { recursive: true });
-            }
-
-            const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-            const urlSlug = url.split("/").filter(Boolean).slice(-2).join("-").replace(/[^a-zA-Z0-9-]/g, "_");
-            const htmlPath = path.join(testDir, `search-error-${browserName.toLowerCase()}-${urlSlug}-${timestamp}.html`);
-
-            const finalContent = await page.content();
-            fs.writeFileSync(htmlPath, finalContent);
-            console.log(`  💾 Saved error HTML: ${htmlPath}`);
-          } catch (saveError) {
-            console.log(`  ⚠️  Failed to save HTML: ${saveError.message}`);
+      // If Cloudflare wasn't resolved after 5 attempts, save HTML and throw error
+      if (!cloudflareResolved) {
+        // Save HTML for investigation
+        try {
+          const testDir = path.join(process.cwd(), "test");
+          if (!fs.existsSync(testDir)) {
+            fs.mkdirSync(testDir, { recursive: true });
           }
 
-          await page.close();
-          throw new Error(`Cloudflare challenge not resolved with ${browserName} after 5 attempts`);
+          const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+          const urlSlug = url.split("/").filter(Boolean).slice(-2).join("-").replace(/[^a-zA-Z0-9-]/g, "_");
+          const htmlPath = path.join(testDir, `search-error-${browserName.toLowerCase()}-${urlSlug}-${timestamp}.html`);
+
+          const finalContent = await page.content();
+          fs.writeFileSync(htmlPath, finalContent);
+          console.log(`  💾 Saved error HTML: ${htmlPath}`);
+        } catch (saveError) {
+          console.log(`  ⚠️  Failed to save HTML: ${saveError.message}`);
         }
+
+        await page.close();
+        throw new Error(`Cloudflare challenge not resolved with ${browserName} after 5 attempts`);
       }
 
       // Check for access denied/blocked
@@ -614,8 +816,26 @@ class BatchCrawler {
             retryAttempts++;
             console.log(`  ⚠️  Links not loaded - detected "Try again" button (attempt ${retryAttempts}/${maxRetries})`);
 
-            // On first retry with retry button, switch to headless=false mode
+            // On first retry with retry button, try captcha solver first
             if (retryAttempts === 1) {
+              console.log(`  🔍 Checking for Turnstile captcha before switching browsers...`);
+
+              // Try to detect and solve captcha
+              try {
+                const hasTurnstile = await this.captchaSolver.detectTurnstileCaptcha(page);
+                if (hasTurnstile) {
+                  console.log(`  🔐 Turnstile detected on retry, attempting to solve...`);
+                  const solved = await this.captchaSolver.handleTurnstileCaptcha(page);
+                  if (solved) {
+                    console.log(`  ✅ Captcha solved! Retrying link detection...`);
+                    await page.waitForTimeout(2000);
+                    continue; // Retry the while loop to check for links
+                  }
+                }
+              } catch (captchaError) {
+                console.log(`  ⚠️  Captcha solver error: ${captchaError.message}`);
+              }
+
               console.log(`  🔄 Switching to HEADLESS=FALSE mode for better success...`);
 
               // Close current page
@@ -708,6 +928,22 @@ class BatchCrawler {
               });
               await visiblePage.waitForTimeout(2000);
 
+              // Check for Turnstile captcha in visible browser
+              console.log("  🔍 Checking for Turnstile captcha in visible browser...");
+              try {
+                const visibleHasTurnstile = await this.captchaSolver.detectTurnstileCaptcha(visiblePage);
+                if (visibleHasTurnstile) {
+                  console.log(`  🔐 Turnstile detected in visible browser, attempting to solve...`);
+                  const visibleSolved = await this.captchaSolver.handleTurnstileCaptcha(visiblePage);
+                  if (visibleSolved) {
+                    console.log(`  ✅ Captcha solved in visible browser!`);
+                    await visiblePage.waitForTimeout(3000);
+                  }
+                }
+              } catch (visibleCaptchaError) {
+                console.log(`  ⚠️  Captcha solver error in visible browser: ${visibleCaptchaError.message}`);
+              }
+
               // Check for retry button and click it
               const visibleRetryButton = await visiblePage.locator('button.RetryButton').count();
               if (visibleRetryButton > 0) {
@@ -781,7 +1017,8 @@ class BatchCrawler {
             }
 
             await page.close();
-            return { studyUrls: [], nextPageUrl: null, currentPage: 1 };
+            // Throw error to trigger browser fallback instead of returning empty results
+            throw new Error(`No study links found with ${browserName} - trying next browser configuration`);
           }
         }
       }
@@ -809,11 +1046,14 @@ class BatchCrawler {
         }
 
         await page.close();
-        return { studyUrls: [], nextPageUrl: null, currentPage: 1 };
+        // Throw error to trigger browser fallback instead of returning empty results
+        throw new Error(`No study links found after ${maxRetries} retries with ${browserName} - trying next browser configuration`);
       }
 
       // Extract all study URLs from this page
+      console.log("  🔍 Extracting study URLs from page...");
       const studyUrls = await extractStudyUrlsFromSearchPage(page);
+      console.log(`  ✓ Found ${studyUrls.length} study URLs`);
 
       // Get next page URL
       const baseUrl =
@@ -825,53 +1065,164 @@ class BatchCrawler {
       // Get current page number
       const currentPage = await getCurrentPageNumber(page, url);
 
-      await page.close();
+      console.log("  🧹 Closing browser...");
 
+      // Add timeout for page.close() to prevent hanging
+      try {
+        await Promise.race([
+          page.close(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Page close timeout')), 5000)
+          )
+        ]);
+        console.log("  ✓ Page closed");
+      } catch (e) {
+        console.log("  ⚠️  Page close failed or timed out:", e.message);
+      }
+
+      if (tempContext) {
+        try {
+          await Promise.race([
+            tempContext.close(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Context close timeout')), 5000)
+            )
+          ]);
+          console.log("  ✓ Context closed");
+        } catch (e) {
+          console.log("  ⚠️  Context close failed or timed out:", e.message);
+        }
+      }
+
+      if (tempBrowser) {
+        try {
+          await Promise.race([
+            tempBrowser.close(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Browser close timeout')), 5000)
+            )
+          ]);
+          console.log("  ✓ Browser closed");
+        } catch (e) {
+          console.log("  ⚠️  Browser close failed or timed out:", e.message);
+        }
+      }
+
+      console.log("  ✅ Search page crawling completed successfully");
       return { studyUrls, nextPageUrl, currentPage };
     } catch (error) {
-      await page.close();
+      console.log("  ❌ Error occurred, cleaning up browser...");
+      try {
+        await Promise.race([
+          page.close(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+        ]);
+        console.log("  ✓ Page closed");
+      } catch (e) {
+        console.log("  ⚠️  Failed to close page:", e.message);
+      }
+
+      if (tempContext) {
+        try {
+          await Promise.race([
+            tempContext.close(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+          ]);
+          console.log("  ✓ Context closed");
+        } catch (e) {
+          console.log("  ⚠️  Failed to close context:", e.message);
+        }
+      }
+
+      if (tempBrowser) {
+        try {
+          await Promise.race([
+            tempBrowser.close(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+          ]);
+          console.log("  ✓ Browser closed");
+        } catch (e) {
+          console.log("  ⚠️  Failed to close browser:", e.message);
+        }
+      }
+
       throw error;
     }
   }
 
   /**
    * Scrape a single study page
-   * Uses WEBKIT browser for better Cloudflare evasion
-   * Falls back to CHROMIUM if Cloudflare blocks WebKit
-   * Falls back to headless=false mode if both browsers fail
+   * Browser fallback order: webkit → webkit (headless=false) → chromium → chromium (headless=false)
    */
   async scrapeStudyPage(url, countryLabel, portalType, countryKey) {
-    // Try WebKit first
-    try {
-      return await this._scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, 'webkit');
-    } catch (webkitError) {
-      // If WebKit fails with Cloudflare, wait 5 seconds then try Chromium
-      if (webkitError.message && webkitError.message.includes('Cloudflare')) {
-        console.log("  🔄 WebKit blocked by Cloudflare, waiting 5 seconds before switching to Chromium...");
-        await this.delay(5000);
+    const fallbackOrder = [
+      { browser: 'webkit', headless: true },
+      { browser: 'webkit', headless: false },
+      { browser: 'chromium', headless: true },
+      { browser: 'chromium', headless: false }
+    ];
 
-        try {
-          return await this._scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, 'chromium');
-        } catch (chromiumError) {
-          // If Chromium also fails with Cloudflare, try visible browser (headless=false)
-          if (chromiumError.message && chromiumError.message.includes('Cloudflare')) {
-            console.log("  🔄 Both browsers blocked by Cloudflare, switching to HEADLESS=FALSE mode...");
-            await this.delay(5000);
-            return await this._scrapeStudyPageWithVisibleBrowser(url, countryLabel, portalType, countryKey);
-          }
-          throw chromiumError;
+    for (let i = 0; i < fallbackOrder.length; i++) {
+      const { browser, headless } = fallbackOrder[i];
+      const isLastAttempt = i === fallbackOrder.length - 1;
+
+      try {
+        console.log(`  🔄 Attempting with ${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'}...`);
+        return await this._scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, browser, headless);
+      } catch (error) {
+        if (isLastAttempt) {
+          throw error;
         }
+        console.log(`  ⚠️  ${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'} failed: ${error.message.split('\n')[0]}`);
+        console.log(`  🔄 Switching to next browser configuration...`);
+        await this.delay(3000);
       }
-      throw webkitError;
     }
   }
 
   /**
    * Internal method to scrape study page with specific browser
    */
-  async _scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, browserType) {
-    const context = browserType === 'chromium' ? this.chromiumContext : this.webkitContext;
+  async _scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, browserType, useHeadless = true) {
+    // If requesting non-headless mode, create a temporary browser instance
+    let tempBrowser = null;
+    let tempContext = null;
+    let context;
     const browserName = browserType.toUpperCase();
+
+    if (!useHeadless) {
+      // Launch temporary visible browser
+      tempBrowser = browserType === 'chromium'
+        ? await chromium.launch({
+            headless: false,
+            args: ["--start-maximized", "--no-sandbox", "--disable-setuid-sandbox"]
+          })
+        : await webkit.launch({
+            headless: false,
+            args: ["--no-sandbox", "--disable-setuid-sandbox"]
+          });
+
+      const userAgent = browserType === 'chromium'
+        ? this.getChromiumUserAgent()
+        : this.getWebKitUserAgent();
+
+      tempContext = await tempBrowser.newContext({
+        viewport: { width: 1920, height: 1080 },
+        userAgent: userAgent,
+        locale: "en-US",
+        timezoneId: "America/New_York",
+      });
+
+      await tempContext.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      });
+
+      context = tempContext;
+    } else {
+      // Use existing headless context
+      context = browserType === 'chromium' ? this.chromiumContext : this.webkitContext;
+    }
+
     const page = await context.newPage();
 
     try {
@@ -958,14 +1309,58 @@ class BatchCrawler {
         .waitForLoadState("networkidle", { timeout: 15000 })
         .catch(() => {});
 
-      // Check for Cloudflare with enhanced handling
-      const pageTitle = await page.title();
-      const pageContent = await page.content();
+      // Check if study page loaded successfully by looking for Hero section FIRST
+      const hasHeroSection = await page.locator('#Hero').count() > 0;
+      let cloudflareResolved = false;
+      let pageContent = ''; // Declare outside if/else
 
-      if (pageTitle.includes("Just a moment") || pageTitle.includes("Attention Required")) {
+      if (hasHeroSection) {
+        console.log(`  ✅ Study page loaded successfully - found #Hero section, skipping Cloudflare check`);
+        cloudflareResolved = true;
+      } else {
+        // Only check for Cloudflare if Hero section not found
+        console.log(`  ⚠️  #Hero section not found, checking for Cloudflare challenge...`);
+
+        const pageTitle = await page.title();
+        pageContent = await page.content();
+
+        // FIRST: Check if this is a Cloudflare block page (not a captcha)
+        const isBlockedPage = await page.evaluate(() => {
+          const errorHeading = document.querySelector('#cf-wrapper #cf-error-details h1');
+          return errorHeading?.innerText?.trim() === 'Sorry, you have been blocked';
+        });
+
+        if (isBlockedPage) {
+          console.log(`  🚫 Cloudflare BLOCKED this ${browserName} - switching to next browser immediately`);
+          await page.close();
+          throw new Error(`Cloudflare blocked ${browserName} - IP/browser fingerprint detected`);
+        }
+
+        // Second, try to detect and solve Turnstile captcha using 2captcha
+        const hasTurnstile = await this.captchaSolver.detectTurnstileCaptcha(page);
+
+        if (hasTurnstile) {
+        console.log("  🔐 Cloudflare Turnstile captcha detected on study page! Attempting to solve with 2captcha...");
+
+        try {
+          const solved = await this.captchaSolver.handleTurnstileCaptcha(page);
+
+          if (solved) {
+            console.log("  ✅ Turnstile captcha bypassed successfully!");
+            cloudflareResolved = true;
+          } else {
+            console.log("  ⚠️  Failed to bypass Turnstile captcha, trying fallback method...");
+          }
+        } catch (error) {
+          console.error("  ❌ Error solving Turnstile captcha:", error.message);
+          console.log("  🔄 Falling back to human behavior simulation...");
+        }
+      }
+
+      // If not resolved by captcha solver, or if it's a non-Turnstile challenge, use simulation
+      if (!cloudflareResolved && (pageTitle.includes("Just a moment") || pageTitle.includes("Attention Required"))) {
         console.log("  ⚠️  Cloudflare detected on study page, simulating human behavior...");
 
-        let cloudflareResolved = false;
         for (let i = 0; i < 5; i++) {
           await page.mouse.move(
             Math.floor(Math.random() * 500) + 200,
@@ -996,15 +1391,16 @@ class BatchCrawler {
           await page.close();
           throw new Error(`Cloudflare challenge not resolved with ${browserName} after 5 attempts`);
         }
-      }
+        }
 
-      // Check for access denied/blocked
-      if (pageContent.includes("Access denied") ||
-          pageContent.includes("blocked") ||
-          pageContent.includes("Sorry, you have been blocked")) {
-        await page.close();
-        throw new Error(`Cloudflare blocked access with ${browserName}`);
-      }
+        // Check for access denied/blocked (only if we checked for Cloudflare)
+        if (pageContent.includes("Access denied") ||
+            pageContent.includes("blocked") ||
+            pageContent.includes("Sorry, you have been blocked")) {
+          await page.close();
+          throw new Error(`Cloudflare blocked access with ${browserName}`);
+        }
+      } // End of else block for Cloudflare checking
 
       // Wait for main content
       console.log("  ⏳ Waiting for #Hero section...");
@@ -1016,9 +1412,12 @@ class BatchCrawler {
       console.log("  ✓ #QuickFacts loaded");
 
       await page.waitForTimeout(3000);
+      console.log("  🔍 Starting data extraction...");
 
       // Extract data using the same logic as the original crawlers
-      const data = await page.evaluate(() => {
+      // Add timeout to prevent indefinite hanging
+      const data = await Promise.race([
+        page.evaluate(() => {
         const result = {};
 
         // Hero section
@@ -1132,7 +1531,14 @@ class BatchCrawler {
           });
 
         return result;
-      });
+        }),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Data extraction timed out after 60 seconds')), 60000)
+        )
+      ]);
+
+      console.log("  ✓ Data extraction completed");
+      console.log("  💾 Preparing to save to CSV...");
 
       // Add metadata
       const fullData = {
@@ -1161,15 +1567,100 @@ class BatchCrawler {
         countryLabel
       );
 
-      await page.close();
+      console.log("  ✓ CSV save completed");
+      console.log("  🧹 Closing browser...");
+
+      // Add timeout for page.close() to prevent hanging
+      try {
+        await Promise.race([
+          page.close(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Page close timeout')), 5000)
+          )
+        ]);
+        console.log("  ✓ Page closed");
+      } catch (e) {
+        console.log("  ⚠️  Page close failed or timed out:", e.message);
+      }
+
+      if (tempContext) {
+        try {
+          await Promise.race([
+            tempContext.close(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Context close timeout')), 5000)
+            )
+          ]);
+          console.log("  ✓ Context closed");
+        } catch (e) {
+          console.log("  ⚠️  Context close failed or timed out:", e.message);
+        }
+      }
+
+      if (tempBrowser) {
+        try {
+          await Promise.race([
+            tempBrowser.close(),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('Browser close timeout')), 5000)
+            )
+          ]);
+          console.log("  ✓ Browser closed");
+        } catch (e) {
+          console.log("  ⚠️  Browser close failed or timed out:", e.message);
+          // Force kill the browser process if it didn't close
+          try {
+            await tempBrowser.close({ timeout: 1000 });
+          } catch (forceError) {
+            console.log("  ⚠️  Force close also failed");
+          }
+        }
+      }
+
+      console.log("  ✅ Study page scraping completed successfully");
       return fullData;
     } catch (error) {
-      await page.close();
+      console.log("  ❌ Error occurred, cleaning up browser...");
+      try {
+        await Promise.race([
+          page.close(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+        ]);
+        console.log("  ✓ Page closed");
+      } catch (e) {
+        console.log("  ⚠️  Failed to close page:", e.message);
+      }
+
+      if (tempContext) {
+        try {
+          await Promise.race([
+            tempContext.close(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+          ]);
+          console.log("  ✓ Context closed");
+        } catch (e) {
+          console.log("  ⚠️  Failed to close context:", e.message);
+        }
+      }
+
+      if (tempBrowser) {
+        try {
+          await Promise.race([
+            tempBrowser.close(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+          ]);
+          console.log("  ✓ Browser closed");
+        } catch (e) {
+          console.log("  ⚠️  Failed to close browser:", e.message);
+        }
+      }
+
       throw error;
     }
   }
 
   /**
+   * DEPRECATED: This method is no longer needed as the fallback logic is now handled in scrapeStudyPage
    * Scrape study page with visible browser (headless=false)
    * Used as last resort when both headless browsers fail with Cloudflare
    */
