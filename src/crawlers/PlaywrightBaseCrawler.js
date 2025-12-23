@@ -67,8 +67,8 @@ export default class PlaywrightBaseCrawler {
     this.targetUrl = config.targetUrl || "";
     this.maxCrawlLength = config.maxCrawlLength || 50;
     this.requestDelay = config.requestDelay || 2000;
-    this.headless = config.headless !== undefined ? config.headless : true; // Default to true
-    this.browserEngine = config.browserEngine || "webkit"; // Default to webkit for better Cloudflare evasion
+    this.headless = config.headless !== undefined ? config.headless : false; // Default to FALSE for better Cloudflare evasion
+    this.browserEngine = config.browserEngine || "chromium"; // Default to chromium for better compatibility
 
     this.urlsToVisit = [this.targetUrl];
     this.visitedUrls = new Set();
@@ -183,121 +183,385 @@ export default class PlaywrightBaseCrawler {
       },
     });
 
-    // Additional context-level evasions with aggressive anti-fingerprinting
+    // Additional context-level evasions with comprehensive anti-fingerprinting
     await this.context.addInitScript(() => {
-      // Overwrite the navigator.webdriver property
+      // ========================================
+      // CRITICAL: Remove ALL automation signals
+      // ========================================
+
+      // Delete webdriver from prototype chain
+      delete Object.getPrototypeOf(navigator).webdriver;
+
+      // Overwrite navigator.webdriver with multiple layers
       Object.defineProperty(navigator, 'webdriver', {
         get: () => undefined,
+        configurable: true,
       });
 
-      // Mock permissions
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-          Promise.resolve({ state: Notification.permission }) :
-          originalQuery(parameters)
-      );
+      // Proxy-based webdriver hiding
+      const originalNavigator = navigator;
+      Object.defineProperty(window, 'navigator', {
+        value: new Proxy(originalNavigator, {
+          has: (target, key) => (key === 'webdriver' ? false : key in target),
+          get: (target, key) => (key === 'webdriver' ? undefined : target[key]),
+        }),
+        configurable: true,
+      });
 
-      // Mock plugins and mimeTypes with realistic structure
+      // Remove Playwright/automation globals
+      delete window.__playwright;
+      delete window.__pw_manual;
+      delete window.__PW_inspect;
+      delete window._WEBDRIVER_ELEM_CACHE;
+
+      // ========================================
+      // CLOUDFLARE JS TIMING CHALLENGE FIX
+      // ========================================
+
+      // Fix Date and timing APIs to be consistent
+      const originalDate = Date;
+      const originalDateNow = Date.now;
+      const originalPerformanceNow = performance.now;
+      const startTime = originalDateNow();
+      const startPerformance = originalPerformanceNow.call(performance);
+
+      // Ensure Date.now() and performance.now() are consistent
+      Date.now = function() {
+        return startTime + (originalPerformanceNow.call(performance) - startPerformance);
+      };
+
+      // Fix timezone consistency (CRITICAL for Cloudflare)
+      const originalGetTimezoneOffset = Date.prototype.getTimezoneOffset;
+      Date.prototype.getTimezoneOffset = function() {
+        return 300; // UTC-5 for America/New_York
+      };
+
+      // Fix Intl.DateTimeFormat to match timezone
+      const originalDateTimeFormat = Intl.DateTimeFormat;
+      Intl.DateTimeFormat = function(...args) {
+        if (args.length === 0 || !args[1] || !args[1].timeZone) {
+          args[1] = args[1] || {};
+          args[1].timeZone = 'America/New_York';
+        }
+        return new originalDateTimeFormat(...args);
+      };
+      Object.setPrototypeOf(Intl.DateTimeFormat, originalDateTimeFormat);
+      Intl.DateTimeFormat.prototype = originalDateTimeFormat.prototype;
+
+      // ========================================
+      // Mock permissions with proper Promise handling
+      // ========================================
+
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => {
+        if (parameters.name === 'notifications') {
+          return Promise.resolve({
+            state: Notification?.permission || 'default',
+            onchange: null
+          });
+        }
+        return originalQuery(parameters);
+      };
+
+      // ========================================
+      // Chrome runtime with FULL realistic structure
+      // ========================================
+
+      if (!window.chrome) {
+        window.chrome = {};
+      }
+
+      window.chrome.runtime = {
+        OnInstalledReason: {
+          CHROME_UPDATE: 'chrome_update',
+          INSTALL: 'install',
+          SHARED_MODULE_UPDATE: 'shared_module_update',
+          UPDATE: 'update',
+        },
+        OnRestartRequiredReason: {
+          APP_UPDATE: 'app_update',
+          OS_UPDATE: 'os_update',
+          PERIODIC: 'periodic',
+        },
+        PlatformArch: {
+          ARM: 'arm',
+          ARM64: 'arm64',
+          X86_32: 'x86-32',
+          X86_64: 'x86-64',
+        },
+        PlatformOs: {
+          ANDROID: 'android',
+          LINUX: 'linux',
+          MAC: 'mac',
+          WIN: 'win',
+        },
+      };
+
+      window.chrome.loadTimes = function() {
+        const now = Date.now() / 1000;
+        return {
+          commitLoadTime: now - Math.random() * 2,
+          connectionInfo: 'http/1.1',
+          finishDocumentLoadTime: now - Math.random(),
+          finishLoadTime: now - Math.random(),
+          firstPaintAfterLoadTime: 0,
+          firstPaintTime: now - Math.random() * 2,
+          navigationType: 'Other',
+          npnNegotiatedProtocol: 'unknown',
+          requestTime: now - Math.random() * 3,
+          startLoadTime: now - Math.random() * 3,
+          wasAlternateProtocolAvailable: false,
+          wasFetchedViaSpdy: false,
+          wasNpnNegotiated: false,
+        };
+      };
+
+      window.chrome.csi = function() {
+        return {
+          onloadT: Date.now(),
+          pageT: Date.now() - Math.random() * 1000,
+          startE: Date.now() - Math.random() * 3000,
+          tran: 15,
+        };
+      };
+
+      window.chrome.app = {
+        isInstalled: false,
+        InstallState: {
+          DISABLED: 'disabled',
+          INSTALLED: 'installed',
+          NOT_INSTALLED: 'not_installed',
+        },
+        RunningState: {
+          CANNOT_RUN: 'cannot_run',
+          READY_TO_RUN: 'ready_to_run',
+          RUNNING: 'running',
+        },
+      };
+
+      // ========================================
+      // Realistic plugins (Chrome PDF plugins)
+      // ========================================
+
       Object.defineProperty(navigator, 'plugins', {
         get: () => {
           const plugins = [
-            { 0: { type: "application/x-google-chrome-pdf" }, description: "Portable Document Format", filename: "internal-pdf-viewer", length: 1, name: "Chrome PDF Plugin" },
-            { 0: { type: "application/pdf" }, description: "", filename: "mhjfbmdgcfjbbpaeojofohoefgiehjai", length: 1, name: "Chrome PDF Viewer" },
-            { 0: { type: "application/x-nacl" }, 1: { type: "application/x-pnacl" }, description: "", filename: "internal-nacl-plugin", length: 2, name: "Native Client" }
+            {
+              0: { type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' },
+              description: 'Portable Document Format',
+              filename: 'internal-pdf-viewer',
+              length: 1,
+              name: 'Chrome PDF Plugin',
+            },
+            {
+              0: { type: 'application/pdf', suffixes: 'pdf', description: '' },
+              description: '',
+              filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
+              length: 1,
+              name: 'Chrome PDF Viewer',
+            },
+            {
+              0: { type: 'application/x-nacl', suffixes: '', description: 'Native Client Executable' },
+              1: { type: 'application/x-pnacl', suffixes: '', description: 'Portable Native Client Executable' },
+              description: '',
+              filename: 'internal-nacl-plugin',
+              length: 2,
+              name: 'Native Client',
+            },
           ];
-          plugins.refresh = () => {};
-          return plugins;
+          return Object.setPrototypeOf(plugins, PluginArray.prototype);
         },
+        configurable: true,
       });
+
+      // ========================================
+      // Navigator properties (stable values)
+      // ========================================
 
       Object.defineProperty(navigator, 'languages', {
         get: () => ['en-US', 'en'],
+        configurable: true,
       });
-
-      // Chrome runtime with more methods
-      window.chrome = {
-        runtime: {},
-        loadTimes: function () { },
-        csi: function () { },
-        app: {},
-      };
 
       Object.defineProperty(navigator, 'platform', {
         get: () => 'Win32',
+        configurable: true,
       });
 
       Object.defineProperty(navigator, 'hardwareConcurrency', {
         get: () => 8,
+        configurable: true,
       });
 
       Object.defineProperty(navigator, 'deviceMemory', {
         get: () => 8,
+        configurable: true,
       });
 
       Object.defineProperty(navigator, 'maxTouchPoints', {
         get: () => 0,
+        configurable: true,
       });
 
-      Object.defineProperty(navigator, 'connection', {
-        get: () => ({
-          effectiveType: '4g',
-          rtt: 50,
-          downlink: 10,
-          saveData: false,
-        }),
-      });
+      // ========================================
+      // Connection API (realistic values)
+      // ========================================
 
-      // Canvas fingerprint randomization
+      if (navigator.connection) {
+        Object.defineProperty(navigator.connection, 'effectiveType', {
+          get: () => '4g',
+          configurable: true,
+        });
+        Object.defineProperty(navigator.connection, 'rtt', {
+          get: () => 50,
+          configurable: true,
+        });
+        Object.defineProperty(navigator.connection, 'downlink', {
+          get: () => 10,
+          configurable: true,
+        });
+      }
+
+      // ========================================
+      // Canvas fingerprint (minimal noise)
+      // ========================================
+
       const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
       HTMLCanvasElement.prototype.toDataURL = function(type) {
-        if (type === 'image/png' && this.width === 0 && this.height === 0) {
-          return originalToDataURL.apply(this, arguments);
+        if (this.width > 0 && this.height > 0) {
+          const context = this.getContext('2d');
+          if (context) {
+            const imageData = context.getImageData(0, 0, this.width, this.height);
+            // Add minimal noise to avoid detection
+            for (let i = 0; i < imageData.data.length; i += 400) {
+              imageData.data[i] = Math.min(255, imageData.data[i] + Math.floor(Math.random() * 2));
+            }
+            context.putImageData(imageData, 0, 0);
+          }
         }
         return originalToDataURL.apply(this, arguments);
       };
 
       const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
       CanvasRenderingContext2D.prototype.getImageData = function() {
-        return originalGetImageData.apply(this, arguments);
+        const imageData = originalGetImageData.apply(this, arguments);
+        // Add minimal consistent noise
+        for (let i = 0; i < imageData.data.length; i += 400) {
+          imageData.data[i] = Math.min(255, imageData.data[i] + Math.floor(Math.random() * 2));
+        }
+        return imageData;
       };
 
-      // WebGL fingerprint evasion
+      // ========================================
+      // WebGL fingerprint (stable values)
+      // ========================================
+
       const getParameter = WebGLRenderingContext.prototype.getParameter;
       WebGLRenderingContext.prototype.getParameter = function(parameter) {
+        // UNMASKED_VENDOR_WEBGL
         if (parameter === 37445) {
           return 'Intel Inc.';
         }
+        // UNMASKED_RENDERER_WEBGL
         if (parameter === 37446) {
           return 'Intel Iris OpenGL Engine';
         }
         return getParameter.apply(this, arguments);
       };
 
-      // Battery API
-      if (navigator.getBattery) {
-        navigator.getBattery = () => Promise.resolve({
-          charging: true,
-          chargingTime: 0,
-          dischargingTime: Infinity,
-          level: 1,
-          addEventListener: () => {},
-          removeEventListener: () => {},
-        });
+      // WebGL2 support
+      if (typeof WebGL2RenderingContext !== 'undefined') {
+        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+          if (parameter === 37445) return 'Intel Inc.';
+          if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+          return getParameter2.apply(this, arguments);
+        };
       }
 
-      // Media devices
+      // ========================================
+      // Battery API (realistic values)
+      // ========================================
+
+      if (navigator.getBattery) {
+        const originalGetBattery = navigator.getBattery;
+        navigator.getBattery = async () => {
+          const battery = await originalGetBattery.call(navigator);
+          Object.defineProperty(battery, 'charging', { get: () => true });
+          Object.defineProperty(battery, 'chargingTime', { get: () => 0 });
+          Object.defineProperty(battery, 'dischargingTime', { get: () => Infinity });
+          Object.defineProperty(battery, 'level', { get: () => 1 });
+          return battery;
+        };
+      }
+
+      // ========================================
+      // Media devices (stable IDs)
+      // ========================================
+
       if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
         const originalEnumerateDevices = navigator.mediaDevices.enumerateDevices;
-        navigator.mediaDevices.enumerateDevices = async () => {
+        navigator.mediaDevices.enumerateDevices = async function() {
           const devices = await originalEnumerateDevices.call(navigator.mediaDevices);
           return devices.map((device, index) => ({
             ...device,
-            deviceId: `device-${index}`,
-            groupId: `group-${Math.floor(index / 2)}`,
+            deviceId: device.deviceId || `device-${index}-stable`,
+            groupId: device.groupId || `group-${Math.floor(index / 2)}-stable`,
           }));
         };
       }
+
+      // ========================================
+      // Function.toString() fix (CRITICAL)
+      // ========================================
+
+      const originalToString = Function.prototype.toString;
+      Function.prototype.toString = function() {
+        // Make overridden functions look native
+        if (this === HTMLCanvasElement.prototype.toDataURL ||
+            this === CanvasRenderingContext2D.prototype.getImageData ||
+            this === WebGLRenderingContext.prototype.getParameter ||
+            this === navigator.permissions.query ||
+            this === Date.now ||
+            this === Date.prototype.getTimezoneOffset) {
+          return 'function () { [native code] }';
+        }
+        return originalToString.call(this);
+      };
+
+      // ========================================
+      // Error stack trace cleaning
+      // ========================================
+
+      const OriginalError = Error;
+      Error = new Proxy(OriginalError, {
+        construct(target, args) {
+          const err = new target(...args);
+          const originalStackGetter = Object.getOwnPropertyDescriptor(err, 'stack')?.get ||
+                                      Object.getOwnPropertyDescriptor(Error.prototype, 'stack')?.get;
+          if (originalStackGetter) {
+            Object.defineProperty(err, 'stack', {
+              get: function() {
+                const stack = originalStackGetter.call(this);
+                if (typeof stack === 'string') {
+                  return stack.split('\n')
+                    .filter(line => !line.includes('playwright'))
+                    .filter(line => !line.includes('__pw'))
+                    .filter(line => !line.includes('stealth'))
+                    .join('\n');
+                }
+                return stack;
+              },
+              configurable: true,
+            });
+          }
+          return err;
+        },
+      });
+      Error.prototype = OriginalError.prototype;
+      Error.stackTraceLimit = OriginalError.stackTraceLimit;
+
+      console.log('✅ Advanced browser hardening applied');
     });
 
     console.log("✓ Browser launched with STEALTH MODE enabled\n");
@@ -357,34 +621,42 @@ export default class PlaywrightBaseCrawler {
     const page = await this.context.newPage();
 
     try {
-      // Additional page-level stealth measures
+      // Additional page-level stealth measures (defense in depth)
       await page.addInitScript(() => {
-        // Delete automation indicators
+        // Remove automation indicators
         delete navigator.__proto__.webdriver;
-
-        // More comprehensive webdriver override
-        Object.defineProperty(navigator, 'webdriver', {
-          get: () => undefined,
-          configurable: true,
-        });
-
-        // Override automation-related properties
-        Object.defineProperty(window, 'navigator', {
-          value: new Proxy(navigator, {
-            has: (target, key) => (key === 'webdriver' ? false : key in target),
-            get: (target, key) => (key === 'webdriver' ? undefined : target[key]),
-          }),
-        });
+        delete window.__playwright;
+        delete window.__pw_manual;
 
         // Mock realistic screen properties
         Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
-        Object.defineProperty(screen, 'availHeight', { get: () => 1080 });
+        Object.defineProperty(screen, 'availHeight', { get: () => 1040 }); // Account for taskbar
         Object.defineProperty(screen, 'width', { get: () => 1920 });
         Object.defineProperty(screen, 'height', { get: () => 1080 });
 
         // Mock realistic window properties
         Object.defineProperty(window, 'outerWidth', { get: () => 1920 });
         Object.defineProperty(window, 'outerHeight', { get: () => 1080 });
+        Object.defineProperty(window, 'innerWidth', { get: () => 1920 });
+        Object.defineProperty(window, 'innerHeight', { get: () => 1040 });
+
+        // Iframe contentWindow evasion
+        const originalContentWindowGetter = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow')?.get;
+        if (originalContentWindowGetter) {
+          Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+            get: function() {
+              const win = originalContentWindowGetter.call(this);
+              if (win) {
+                try {
+                  win.navigator.webdriver = undefined;
+                } catch (e) {
+                  // Cross-origin, ignore
+                }
+              }
+              return win;
+            }
+          });
+        }
       });
 
       await applyCurrencyByCountry(page, url);

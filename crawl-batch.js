@@ -1,6 +1,7 @@
 import { COUNTRY_CURRENCY_MAP } from "./src/constants/country_currency_map.js";
 import StateManager from "./src/utils/stateManager.js";
 import { CaptchaSolver } from "./src/services/CaptchaSolver.js";
+import { CAPTCHA_CONFIG } from "./src/config/captcha.config.js";
 import { chromium, webkit } from "playwright-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
 import {
@@ -69,7 +70,7 @@ class BatchCrawler {
     this.stateManager = new StateManager();
     this.config = {
       requestDelay: config.requestDelay || 3000,
-      headless: config.headless,
+      headless: config.headless !== undefined ? config.headless : false, // Default to FALSE for better Cloudflare evasion
       maxPagesPerCountry: config.maxPagesPerCountry || 999, // Max search pages to crawl
     };
     // Dual browser setup: Chromium for search, WebKit for study pages
@@ -209,81 +210,189 @@ class BatchCrawler {
       },
     });
 
-    // Additional context-level evasions for both browsers
+    // Additional context-level evasions for both browsers with ENHANCED anti-fingerprinting
     const stealthScript = () => {
-      // Overwrite the navigator.webdriver property
+      // Remove ALL automation signals
+      delete Object.getPrototypeOf(navigator).webdriver;
+      delete window.__playwright;
+      delete window.__pw_manual;
+      delete window.__PW_inspect;
+      delete window._WEBDRIVER_ELEM_CACHE;
+
+      // Multi-layer webdriver hiding
       Object.defineProperty(navigator, 'webdriver', {
         get: () => undefined,
+        configurable: true,
       });
 
-      // Mock permissions
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-          Promise.resolve({ state: Notification.permission }) :
-          originalQuery(parameters)
-      );
+      const originalNavigator = navigator;
+      Object.defineProperty(window, 'navigator', {
+        value: new Proxy(originalNavigator, {
+          has: (target, key) => (key === 'webdriver' ? false : key in target),
+          get: (target, key) => (key === 'webdriver' ? undefined : target[key]),
+        }),
+        configurable: true,
+      });
 
-      // Mock plugins with realistic structure
+      // CLOUDFLARE JS TIMING CHALLENGE FIX - Ensure consistent timing
+      const originalDateNow = Date.now;
+      const originalPerformanceNow = performance.now;
+      const startTime = originalDateNow();
+      const startPerformance = originalPerformanceNow.call(performance);
+
+      Date.now = function() {
+        return startTime + (originalPerformanceNow.call(performance) - startPerformance);
+      };
+
+      Date.prototype.getTimezoneOffset = function() {
+        return 300; // UTC-5 for America/New_York
+      };
+
+      const originalDateTimeFormat = Intl.DateTimeFormat;
+      Intl.DateTimeFormat = function(...args) {
+        if (args.length === 0 || !args[1] || !args[1].timeZone) {
+          args[1] = args[1] || {};
+          args[1].timeZone = 'America/New_York';
+        }
+        return new originalDateTimeFormat(...args);
+      };
+      Object.setPrototypeOf(Intl.DateTimeFormat, originalDateTimeFormat);
+      Intl.DateTimeFormat.prototype = originalDateTimeFormat.prototype;
+
+      // Mock permissions with proper Promise handling
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) => {
+        if (parameters.name === 'notifications') {
+          return Promise.resolve({
+            state: Notification?.permission || 'default',
+            onchange: null
+          });
+        }
+        return originalQuery(parameters);
+      };
+
+      // Full Chrome runtime structure
+      if (!window.chrome) {
+        window.chrome = {};
+      }
+
+      window.chrome.runtime = {
+        OnInstalledReason: {
+          CHROME_UPDATE: 'chrome_update',
+          INSTALL: 'install',
+          UPDATE: 'update',
+        },
+        PlatformOs: {
+          ANDROID: 'android',
+          LINUX: 'linux',
+          MAC: 'mac',
+          WIN: 'win',
+        },
+      };
+
+      window.chrome.loadTimes = function() {
+        const now = Date.now() / 1000;
+        return {
+          commitLoadTime: now - Math.random() * 2,
+          connectionInfo: 'http/1.1',
+          finishLoadTime: now - Math.random(),
+          navigationType: 'Other',
+          requestTime: now - Math.random() * 3,
+          startLoadTime: now - Math.random() * 3,
+        };
+      };
+
+      window.chrome.csi = function() {
+        return {
+          onloadT: Date.now(),
+          pageT: Date.now() - Math.random() * 1000,
+          startE: Date.now() - Math.random() * 3000,
+          tran: 15,
+        };
+      };
+
+      window.chrome.app = {
+        isInstalled: false,
+      };
+
+      // Realistic plugins
       Object.defineProperty(navigator, 'plugins', {
         get: () => {
           const plugins = [
-            { 0: { type: "application/x-google-chrome-pdf" }, description: "Portable Document Format", filename: "internal-pdf-viewer", length: 1, name: "Chrome PDF Plugin" },
-            { 0: { type: "application/pdf" }, description: "", filename: "mhjfbmdgcfjbbpaeojofohoefgiehjai", length: 1, name: "Chrome PDF Viewer" },
-            { 0: { type: "application/x-nacl" }, 1: { type: "application/x-pnacl" }, description: "", filename: "internal-nacl-plugin", length: 2, name: "Native Client" }
+            {
+              0: { type: 'application/x-google-chrome-pdf', suffixes: 'pdf' },
+              description: 'Portable Document Format',
+              filename: 'internal-pdf-viewer',
+              length: 1,
+              name: 'Chrome PDF Plugin',
+            },
+            {
+              0: { type: 'application/pdf', suffixes: 'pdf' },
+              description: '',
+              filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
+              length: 1,
+              name: 'Chrome PDF Viewer',
+            },
           ];
-          plugins.refresh = () => {};
-          return plugins;
+          return Object.setPrototypeOf(plugins, PluginArray.prototype);
         },
+        configurable: true,
       });
 
+      // Navigator properties
       Object.defineProperty(navigator, 'languages', {
         get: () => ['en-US', 'en'],
+        configurable: true,
       });
-
-      // Chrome runtime
-      window.chrome = {
-        runtime: {},
-        loadTimes: function () { },
-        csi: function () { },
-        app: {},
-      };
 
       Object.defineProperty(navigator, 'platform', {
         get: () => 'Win32',
+        configurable: true,
       });
 
       Object.defineProperty(navigator, 'hardwareConcurrency', {
         get: () => 8,
+        configurable: true,
       });
 
       Object.defineProperty(navigator, 'deviceMemory', {
         get: () => 8,
+        configurable: true,
       });
 
       Object.defineProperty(navigator, 'maxTouchPoints', {
         get: () => 0,
+        configurable: true,
       });
 
-      Object.defineProperty(navigator, 'connection', {
-        get: () => ({
-          effectiveType: '4g',
-          rtt: 50,
-          downlink: 10,
-          saveData: false,
-        }),
-      });
+      if (navigator.connection) {
+        Object.defineProperty(navigator.connection, 'effectiveType', {
+          get: () => '4g',
+          configurable: true,
+        });
+        Object.defineProperty(navigator.connection, 'rtt', {
+          get: () => 50,
+          configurable: true,
+        });
+      }
 
-      // Canvas fingerprint evasion
+      // Canvas fingerprint with minimal noise
       const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
       HTMLCanvasElement.prototype.toDataURL = function(type) {
-        if (type === 'image/png' && this.width === 0 && this.height === 0) {
-          return originalToDataURL.apply(this, arguments);
+        if (this.width > 0 && this.height > 0) {
+          const context = this.getContext('2d');
+          if (context) {
+            const imageData = context.getImageData(0, 0, this.width, this.height);
+            for (let i = 0; i < imageData.data.length; i += 400) {
+              imageData.data[i] = Math.min(255, imageData.data[i] + Math.floor(Math.random() * 2));
+            }
+            context.putImageData(imageData, 0, 0);
+          }
         }
         return originalToDataURL.apply(this, arguments);
       };
 
-      // WebGL fingerprint evasion
+      // WebGL fingerprint
       const getParameter = WebGLRenderingContext.prototype.getParameter;
       WebGLRenderingContext.prototype.getParameter = function(parameter) {
         if (parameter === 37445) return 'Intel Inc.';
@@ -291,17 +400,64 @@ class BatchCrawler {
         return getParameter.apply(this, arguments);
       };
 
+      if (typeof WebGL2RenderingContext !== 'undefined') {
+        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+          if (parameter === 37445) return 'Intel Inc.';
+          if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+          return getParameter2.apply(this, arguments);
+        };
+      }
+
       // Battery API
       if (navigator.getBattery) {
-        navigator.getBattery = () => Promise.resolve({
-          charging: true,
-          chargingTime: 0,
-          dischargingTime: Infinity,
-          level: 1,
-          addEventListener: () => {},
-          removeEventListener: () => {},
-        });
+        const originalGetBattery = navigator.getBattery;
+        navigator.getBattery = async () => {
+          const battery = await originalGetBattery.call(navigator);
+          Object.defineProperty(battery, 'charging', { get: () => true });
+          Object.defineProperty(battery, 'level', { get: () => 1 });
+          return battery;
+        };
       }
+
+      // Function.toString() fix to hide overrides
+      const originalToString = Function.prototype.toString;
+      Function.prototype.toString = function() {
+        if (this === HTMLCanvasElement.prototype.toDataURL ||
+            this === WebGLRenderingContext.prototype.getParameter ||
+            this === Date.now ||
+            this === Date.prototype.getTimezoneOffset) {
+          return 'function () { [native code] }';
+        }
+        return originalToString.call(this);
+      };
+
+      // Error stack trace cleaning
+      const OriginalError = Error;
+      Error = new Proxy(OriginalError, {
+        construct(target, args) {
+          const err = new target(...args);
+          const originalStackGetter = Object.getOwnPropertyDescriptor(err, 'stack')?.get;
+          if (originalStackGetter) {
+            Object.defineProperty(err, 'stack', {
+              get: function() {
+                const stack = originalStackGetter.call(this);
+                if (typeof stack === 'string') {
+                  return stack.split('\n')
+                    .filter(line => !line.includes('playwright'))
+                    .filter(line => !line.includes('__pw'))
+                    .join('\n');
+                }
+                return stack;
+              },
+            });
+          }
+          return err;
+        },
+      });
+      Error.prototype = OriginalError.prototype;
+
+      console.log('✅ Advanced browser hardening applied');
     };
 
     await this.chromiumContext.addInitScript(stealthScript);
@@ -329,32 +485,186 @@ class BatchCrawler {
   }
 
   /**
+   * Create a new browser context with 2captcha proxy (residential IP)
+   * @param {string} browserType - 'chromium' or 'webkit'
+   * @param {boolean} headless - Whether to run in headless mode
+   * @returns {Promise<{browser, context}>} - Browser and context with proxy
+   */
+  async createProxyBrowser(browserType = 'chromium', headless = false) {
+    if (!CAPTCHA_CONFIG.proxy.enabled) {
+      throw new Error('Proxy is not enabled in CAPTCHA_CONFIG');
+    }
+
+    const mode = headless ? 'headless' : 'visible';
+    console.log(`  🌐 Launching ${browserType.toUpperCase()} (${mode}) with 2captcha PROXY (Residential IP)...`);
+    console.log(`     Proxy: ${CAPTCHA_CONFIG.proxy.server}`);
+
+    const browserEngine = browserType === 'chromium' ? chromium : webkit;
+    const userAgent = browserType === 'chromium'
+      ? this.getChromiumUserAgent()
+      : this.getWebKitUserAgent();
+
+    // Launch browser
+    const browser = await browserEngine.launch({
+      headless: headless,
+      args: browserType === 'chromium'
+        ? [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--start-maximized"
+          ]
+        : ["--no-sandbox", "--disable-setuid-sandbox"]
+    });
+
+    // Create context with proxy
+    const context = await browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: userAgent,
+      locale: "en-US",
+      timezoneId: "America/New_York",
+      permissions: ["geolocation"],
+      geolocation: { longitude: -74.006, latitude: 40.7128 },
+      proxy: {
+        server: `http://${CAPTCHA_CONFIG.proxy.server}`,
+        username: CAPTCHA_CONFIG.proxy.username,
+        password: CAPTCHA_CONFIG.proxy.password
+      },
+      extraHTTPHeaders: {
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+      }
+    });
+
+    // Apply stealth script
+    await context.addInitScript(this.getStealthScript());
+
+    console.log(`  ✅ Proxy browser launched successfully`);
+
+    return { browser, context };
+  }
+
+  /**
+   * Get the stealth script (extracted for reuse)
+   */
+  getStealthScript() {
+    return () => {
+      // Remove ALL automation signals
+      delete Object.getPrototypeOf(navigator).webdriver;
+      delete window.__playwright;
+      delete window.__pw_manual;
+      delete window.__PW_inspect;
+      delete window._WEBDRIVER_ELEM_CACHE;
+
+      // Multi-layer webdriver hiding
+      Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+        configurable: true,
+      });
+
+      const originalNavigator = navigator;
+      Object.defineProperty(window, 'navigator', {
+        value: new Proxy(originalNavigator, {
+          has: (target, key) => (key === 'webdriver' ? false : key in target),
+          get: (target, key) => (key === 'webdriver' ? undefined : target[key]),
+        }),
+        configurable: true,
+      });
+
+      // CLOUDFLARE JS TIMING CHALLENGE FIX
+      const originalDateNow = Date.now;
+      const originalPerformanceNow = performance.now;
+      const startTime = originalDateNow();
+      const startPerformance = originalPerformanceNow.call(performance);
+
+      Date.now = function() {
+        return startTime + (originalPerformanceNow.call(performance) - startPerformance);
+      };
+
+      Date.prototype.getTimezoneOffset = function() {
+        return 300; // UTC-5 for America/New_York
+      };
+
+      const originalDateTimeFormat = Intl.DateTimeFormat;
+      Intl.DateTimeFormat = function(...args) {
+        if (args.length === 0 || !args[1] || !args[1].timeZone) {
+          args[1] = args[1] || {};
+          args[1].timeZone = 'America/New_York';
+        }
+        return new originalDateTimeFormat(...args);
+      };
+      Object.setPrototypeOf(Intl.DateTimeFormat, originalDateTimeFormat);
+      Intl.DateTimeFormat.prototype = originalDateTimeFormat.prototype;
+
+      // Chrome runtime
+      if (!window.chrome) {
+        window.chrome = {};
+      }
+      window.chrome.runtime = {
+        OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', UPDATE: 'update' },
+        PlatformOs: { ANDROID: 'android', LINUX: 'linux', MAC: 'mac', WIN: 'win' }
+      };
+      window.chrome.loadTimes = function() {
+        const now = Date.now() / 1000;
+        return { commitLoadTime: now - Math.random() * 2, requestTime: now - Math.random() * 3 };
+      };
+
+      // Function.toString() fix
+      const originalToString = Function.prototype.toString;
+      Function.prototype.toString = function() {
+        if (this === Date.now || this === Date.prototype.getTimezoneOffset) {
+          return 'function () { [native code] }';
+        }
+        return originalToString.call(this);
+      };
+
+      console.log('✅ Proxy browser hardening applied');
+    };
+  }
+
+  /**
    * Crawl a single search page and extract study URLs
-   * Browser fallback order: chromium → webkit → webkit (headless=false) → chromium (headless=false)
+   * Browser fallback order: chromium → webkit → webkit (headless=false) → chromium (headless=false) → webkit with PROXY
    */
   async crawlSearchPage(url, countryLabel, portalType, countryKey) {
     const fallbackOrder = [
-      { browser: 'chromium', headless: true },
-      { browser: 'webkit', headless: true },
-      { browser: 'webkit', headless: false },
-      { browser: 'chromium', headless: false }
+      { browser: 'chromium', headless: true, useProxy: false },
+      { browser: 'webkit', headless: true, useProxy: false },
+      { browser: 'webkit', headless: false, useProxy: false },
+      { browser: 'chromium', headless: false, useProxy: false },
+      { browser: 'webkit', headless: CAPTCHA_CONFIG.proxy.headless, useProxy: true } // FINAL FALLBACK: WebKit + Proxy with residential IP
     ];
 
     for (let i = 0; i < fallbackOrder.length; i++) {
-      const { browser, headless } = fallbackOrder[i];
+      const { browser, headless, useProxy } = fallbackOrder[i];
       const isLastAttempt = i === fallbackOrder.length - 1;
 
       try {
-        console.log(`  🔄 Attempting with ${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'}...`);
-        return await this._crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, browser, headless);
+        const browserLabel = `${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'}${useProxy ? ' + PROXY' : ''}`;
+        console.log(`  🔄 Attempting with ${browserLabel}...`);
+
+        return await this._crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, browser, headless, useProxy);
       } catch (error) {
+        const browserLabel = `${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'}${useProxy ? ' + PROXY' : ''}`;
+
+        // Check if this is a SKIP_TO_PROXY error
+        if (error.message.startsWith('SKIP_TO_PROXY:')) {
+          console.log(`  ⚡ Skipping remaining browser configs, jumping to PROXY...`);
+          // Jump directly to proxy (last item in fallback order)
+          i = fallbackOrder.length - 2; // Will increment to length-1 in next iteration
+          await this.delay(2000);
+          continue;
+        }
+
         if (isLastAttempt) {
-          // All browser configurations failed - return empty results to skip to next country
-          console.log(`  ❌ All browser configurations exhausted. No study links found on this search page.`);
+          // All browser configurations failed including proxy - return empty results
+          console.log(`  ❌ All browser configurations exhausted (including 2captcha proxy).`);
           console.log(`  ⏭️  Moving to next country/search page...`);
           return { studyUrls: [], nextPageUrl: null, currentPage: 1 };
         }
-        console.log(`  ⚠️  ${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'} failed: ${error.message.split('\n')[0]}`);
+        console.log(`  ⚠️  ${browserLabel} failed: ${error.message.split('\n')[0]}`);
         console.log(`  🔄 Switching to next browser configuration...`);
         await this.delay(3000);
       }
@@ -364,15 +674,22 @@ class BatchCrawler {
   /**
    * Internal method to crawl search page with specific browser
    */
-  async _crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, browserType, useHeadless = true) {
-    // If requesting non-headless mode, create a temporary browser instance
+  async _crawlSearchPageWithBrowser(url, countryLabel, portalType, countryKey, browserType, useHeadless = true, useProxy = false) {
+    // If requesting proxy mode, create a new browser with proxy
     let tempBrowser = null;
     let tempContext = null;
     let context;
     const browserName = browserType.toUpperCase();
 
-    if (!useHeadless) {
-      // Launch temporary visible browser
+    if (useProxy) {
+      // Launch browser with 2captcha proxy (residential IP)
+      console.log(`  🔐 Using 2captcha PROXY for Cloudflare bypass...`);
+      const { browser, context: proxyContext } = await this.createProxyBrowser(browserType, useHeadless);
+      tempBrowser = browser;
+      tempContext = proxyContext;
+      context = tempContext;
+    } else if (!useHeadless) {
+      // Launch temporary visible browser (no proxy)
       tempBrowser = browserType === 'chromium'
         ? await chromium.launch({
             headless: false,
@@ -400,7 +717,7 @@ class BatchCrawler {
 
       context = tempContext;
     } else {
-      // Use existing headless context
+      // Use existing headless context (no proxy)
       context = browserType === 'chromium' ? this.chromiumContext : this.webkitContext;
     }
 
@@ -598,6 +915,20 @@ class BatchCrawler {
         // Second, try to detect and solve Turnstile captcha using 2captcha
         const hasTurnstile = await this.captchaSolver.detectTurnstileCaptcha(page);
 
+        // If Cloudflare detected but no Turnstile sitekey, skip to proxy immediately
+        if (!hasTurnstile && (pageTitle.includes("Just a moment") || pageTitle.includes("Attention Required"))) {
+          console.log("  🚀 Cloudflare auto-challenge detected - skipping to PROXY solution...");
+          try {
+            await Promise.race([
+              page.close(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Page close timeout')), 5000))
+            ]);
+          } catch (closeError) {
+            console.log(`  ⚠️  Failed to close page: ${closeError.message}`);
+          }
+          throw new Error('SKIP_TO_PROXY: Cloudflare auto-challenge detected');
+        }
+
         if (hasTurnstile) {
         console.log("  🔐 Cloudflare Turnstile captcha detected!");
         console.log("  🔍 Opening VISIBLE browser for investigation...");
@@ -648,19 +979,38 @@ class BatchCrawler {
 
             if (solved) {
               console.log("  ✅ Captcha solved successfully in visible browser!");
-              console.log("  ⏸️  Check the browser to see the result");
+
+              // Wait a moment to ensure captcha solution is applied
+              await visiblePage.waitForTimeout(3000);
+
+              // Check if we can now access the page
+              const newTitle = await visiblePage.title();
+              if (!newTitle.includes("Just a moment") && !newTitle.includes("Attention Required")) {
+                console.log("  ✅ Captcha bypass confirmed - page accessible");
+                cloudflareResolved = true;
+
+                // Close visible browser and continue with regular flow
+                await visibleBrowser.close();
+              } else {
+                console.log("  ⚠️  Captcha solved but Cloudflare still blocking");
+                await visibleBrowser.close();
+                throw new Error('Captcha solved but Cloudflare still blocking - moving to next browser fallback');
+              }
             } else {
-              console.log("  ❌ Failed to solve captcha");
+              console.log("  ❌ Failed to solve captcha - moving to next browser fallback");
+              await visibleBrowser.close();
+              throw new Error('Captcha solving failed - moving to next browser fallback');
             }
           } catch (error) {
             console.error(`  ❌ Error solving captcha: ${error.message}`);
+            await visibleBrowser.close();
+            throw new Error(`Captcha solving error: ${error.message} - moving to next browser fallback`);
           }
+        } else {
+          console.log("  ⚠️  No Turnstile captcha detected in visible browser");
+          await visibleBrowser.close();
+          throw new Error('No captcha detected - moving to next browser fallback');
         }
-
-        console.log("  ⏸️  Press Ctrl+C when done investigating");
-
-        // Wait indefinitely for manual inspection
-        await new Promise(() => {}); // Never resolves - user will Ctrl+C
       }
 
       // If not resolved by captcha solver, or if it's a non-Turnstile challenge, use simulation
@@ -691,8 +1041,7 @@ class BatchCrawler {
             console.log(`  ⏳ Still solving... (${i + 2}/5)`);
           }
         }
-        }
-      } // End of else block for Cloudflare checking
+      }
 
       // If Cloudflare wasn't resolved after 5 attempts, save HTML and throw error
       if (!cloudflareResolved) {
@@ -714,7 +1063,14 @@ class BatchCrawler {
           console.log(`  ⚠️  Failed to save HTML: ${saveError.message}`);
         }
 
-        await page.close();
+        try {
+          await Promise.race([
+            page.close(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Page close timeout')), 5000))
+          ]);
+        } catch (closeError) {
+          console.log(`  ⚠️  Failed to close page: ${closeError.message}`);
+        }
         throw new Error(`Cloudflare challenge not resolved with ${browserName} after 5 attempts`);
       }
 
@@ -739,9 +1095,17 @@ class BatchCrawler {
           console.log(`  ⚠️  Failed to save HTML: ${saveError.message}`);
         }
 
-        await page.close();
+        try {
+          await Promise.race([
+            page.close(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Page close timeout')), 5000))
+          ]);
+        } catch (closeError) {
+          console.log(`  ⚠️  Failed to close page: ${closeError.message}`);
+        }
         throw new Error(`Cloudflare blocked access with ${browserName}`);
       }
+      } // End of else block for Cloudflare checking
 
       // Capture screenshot AFTER Cloudflare check
       try {
@@ -1152,28 +1516,42 @@ class BatchCrawler {
 
   /**
    * Scrape a single study page
-   * Browser fallback order: webkit → webkit (headless=false) → chromium → chromium (headless=false)
+   * Browser fallback order: webkit → webkit (headless=false) → chromium → chromium (headless=false) → webkit with PROXY
    */
   async scrapeStudyPage(url, countryLabel, portalType, countryKey) {
     const fallbackOrder = [
-      { browser: 'webkit', headless: true },
-      { browser: 'webkit', headless: false },
-      { browser: 'chromium', headless: true },
-      { browser: 'chromium', headless: false }
+      { browser: 'webkit', headless: true, useProxy: false },
+      { browser: 'webkit', headless: false, useProxy: false },
+      { browser: 'chromium', headless: true, useProxy: false },
+      { browser: 'chromium', headless: false, useProxy: false },
+      { browser: 'webkit', headless: CAPTCHA_CONFIG.proxy.headless, useProxy: true } // FINAL FALLBACK: WebKit + Proxy with residential IP
     ];
 
     for (let i = 0; i < fallbackOrder.length; i++) {
-      const { browser, headless } = fallbackOrder[i];
+      const { browser, headless, useProxy } = fallbackOrder[i];
       const isLastAttempt = i === fallbackOrder.length - 1;
 
       try {
-        console.log(`  🔄 Attempting with ${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'}...`);
-        return await this._scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, browser, headless);
+        const browserLabel = `${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'}${useProxy ? ' + PROXY' : ''}`;
+        console.log(`  🔄 Attempting with ${browserLabel}...`);
+
+        return await this._scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, browser, headless, useProxy);
       } catch (error) {
+        const browserLabel = `${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'}${useProxy ? ' + PROXY' : ''}`;
+
+        // Check if this is a SKIP_TO_PROXY error
+        if (error.message.startsWith('SKIP_TO_PROXY:')) {
+          console.log(`  ⚡ Skipping remaining browser configs, jumping to PROXY...`);
+          // Jump directly to proxy (last item in fallback order)
+          i = fallbackOrder.length - 2; // Will increment to length-1 in next iteration
+          await this.delay(2000);
+          continue;
+        }
+
         if (isLastAttempt) {
           throw error;
         }
-        console.log(`  ⚠️  ${browser.toUpperCase()}${headless ? ' (headless)' : ' (visible)'} failed: ${error.message.split('\n')[0]}`);
+        console.log(`  ⚠️  ${browserLabel} failed: ${error.message.split('\n')[0]}`);
         console.log(`  🔄 Switching to next browser configuration...`);
         await this.delay(3000);
       }
@@ -1183,15 +1561,22 @@ class BatchCrawler {
   /**
    * Internal method to scrape study page with specific browser
    */
-  async _scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, browserType, useHeadless = true) {
-    // If requesting non-headless mode, create a temporary browser instance
+  async _scrapeStudyPageWithBrowser(url, countryLabel, portalType, countryKey, browserType, useHeadless = true, useProxy = false) {
+    // If requesting proxy mode, create a new browser with proxy
     let tempBrowser = null;
     let tempContext = null;
     let context;
     const browserName = browserType.toUpperCase();
 
-    if (!useHeadless) {
-      // Launch temporary visible browser
+    if (useProxy) {
+      // Launch browser with 2captcha proxy (residential IP)
+      console.log(`  🔐 Using 2captcha PROXY for Cloudflare bypass on study page...`);
+      const { browser, context: proxyContext } = await this.createProxyBrowser(browserType, useHeadless);
+      tempBrowser = browser;
+      tempContext = proxyContext;
+      context = tempContext;
+    } else if (!useHeadless) {
+      // Launch temporary visible browser (no proxy)
       tempBrowser = browserType === 'chromium'
         ? await chromium.launch({
             headless: false,
@@ -1338,6 +1723,20 @@ class BatchCrawler {
 
         // Second, try to detect and solve Turnstile captcha using 2captcha
         const hasTurnstile = await this.captchaSolver.detectTurnstileCaptcha(page);
+
+        // If Cloudflare detected but no Turnstile sitekey, skip to proxy immediately
+        if (!hasTurnstile && (pageTitle.includes("Just a moment") || pageTitle.includes("Attention Required"))) {
+          console.log("  🚀 Cloudflare auto-challenge detected on study page - skipping to PROXY solution...");
+          try {
+            await Promise.race([
+              page.close(),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Page close timeout')), 5000))
+            ]);
+          } catch (closeError) {
+            console.log(`  ⚠️  Failed to close page: ${closeError.message}`);
+          }
+          throw new Error('SKIP_TO_PROXY: Cloudflare auto-challenge detected on study page');
+        }
 
         if (hasTurnstile) {
         console.log("  🔐 Cloudflare Turnstile captcha detected on study page! Attempting to solve with 2captcha...");

@@ -138,12 +138,29 @@ export class CaptchaSolver {
       const sitekey = await page.evaluate(() => {
           // PRIORITY 1: Check for sitekey in script src URLs FIRST (most reliable)
           // Pattern: https://challenges.cloudflare.com/turnstile/v0/g/SITEKEY/api.js
+          // OR: https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/if/ov2/av0/rcv0/0/SITEKEY/...
           const scripts = document.querySelectorAll('script');
           for (const script of scripts) {
             const src = script.getAttribute('src');
-            if (src && src.includes('challenges.cloudflare.com/turnstile')) {
-              const urlMatch = src.match(/\/turnstile\/v[0-9]+\/g\/([a-zA-Z0-9_-]+)\//);
+            if (src && src.includes('challenges.cloudflare.com')) {
+              // Pattern 1: /turnstile/v0/g/SITEKEY/api.js
+              let urlMatch = src.match(/\/turnstile\/v[0-9]+\/g\/([a-zA-Z0-9_-]{16,})\//);
               if (urlMatch && urlMatch[1]) {
+                console.log('Found sitekey in turnstile script URL (pattern 1):', urlMatch[1]);
+                return urlMatch[1];
+              }
+
+              // Pattern 2: /0/SITEKEY/ (in challenge-platform URLs)
+              urlMatch = src.match(/\/0\/([a-zA-Z0-9_-]{16,})\//);
+              if (urlMatch && urlMatch[1]) {
+                console.log('Found sitekey in challenge-platform URL (pattern 2):', urlMatch[1]);
+                return urlMatch[1];
+              }
+
+              // Pattern 3: Look for any long alphanumeric string in Cloudflare URL
+              urlMatch = src.match(/([a-zA-Z0-9_-]{20,})/);
+              if (urlMatch && urlMatch[1] && !urlMatch[1].includes('challenge') && !urlMatch[1].includes('turnstile')) {
+                console.log('Found potential sitekey in Cloudflare URL (pattern 3):', urlMatch[1]);
                 return urlMatch[1];
               }
             }
@@ -190,8 +207,10 @@ export class CaptchaSolver {
             for (const script of scripts) {
               const scriptText = script.textContent || script.innerText;
               // Look for patterns like: sitekey: "xxx", 'sitekey': 'xxx', "sitekey":"xxx"
-              const sitekeyMatch = scriptText.match(/sitekey['":\s]+['"]([a-zA-Z0-9_-]{10,})['"]/i);
+              // Require at least 16 characters for valid Turnstile sitekey
+              const sitekeyMatch = scriptText.match(/sitekey['":\s]+['"]([a-zA-Z0-9_-]{16,})['"]/i);
               if (sitekeyMatch && sitekeyMatch[1]) {
+                console.log('Found sitekey in script content (pattern 3):', sitekeyMatch[1]);
                 return sitekeyMatch[1];
               }
             }
@@ -201,8 +220,9 @@ export class CaptchaSolver {
             for (const script of scripts2) {
               const scriptText = script.textContent || script.innerText;
               // Pattern: turnstile.render(..., { sitekey: 'xxx' })
-              const renderMatch = scriptText.match(/turnstile\.render\([^)]*sitekey['":\s]+['"]([a-zA-Z0-9_-]{10,})['"]/i);
+              const renderMatch = scriptText.match(/turnstile\.render\([^)]*sitekey['":\s]+['"]([a-zA-Z0-9_-]{16,})['"]/i);
               if (renderMatch && renderMatch[1]) {
+                console.log('Found sitekey in turnstile.render (pattern 4):', renderMatch[1]);
                 return renderMatch[1];
               }
             }
@@ -212,6 +232,48 @@ export class CaptchaSolver {
         });
 
       if (sitekey) {
+        // Validate sitekey length (Turnstile sitekeys are typically 20-40 characters)
+        if (sitekey.length < 16) {
+          if (this.verbose) {
+            console.log(`  ⚠️  Extracted sitekey is too short (${sitekey.length} chars): ${sitekey}`);
+            console.log('  🔍 Attempting to find complete sitekey in page source...');
+          }
+
+          // Try to find complete sitekey by looking at all script sources
+          const completeSitekey = await page.evaluate(() => {
+            const allScripts = Array.from(document.querySelectorAll('script'));
+            console.log('All script sources:');
+            allScripts.forEach((script, i) => {
+              if (script.src) {
+                console.log(`  Script ${i}: ${script.src}`);
+              }
+            });
+
+            // Look for any data-sitekey or sitekey attribute in entire DOM
+            const allElements = document.querySelectorAll('*');
+            for (const el of allElements) {
+              const attrs = el.attributes;
+              for (const attr of attrs) {
+                if (attr.name.includes('sitekey') || attr.value.match(/^[a-zA-Z0-9_-]{16,}$/)) {
+                  console.log(`Found attribute: ${attr.name}="${attr.value}"`);
+                  if (attr.value.length >= 16) {
+                    return attr.value;
+                  }
+                }
+              }
+            }
+
+            return null;
+          });
+
+          if (completeSitekey && completeSitekey.length >= 16) {
+            if (this.verbose) {
+              console.log(`  ✅ Found complete sitekey: ${completeSitekey}`);
+            }
+            return { sitekey: completeSitekey, url: page.url() };
+          }
+        }
+
         if (this.verbose) {
           console.log('  🔍 Cloudflare challenge detected with Turnstile captcha');
           console.log(`  🔑 Sitekey: ${sitekey}`);
